@@ -5307,6 +5307,26 @@ mod hvcc_tests {
         assert!(parse(&bytes).is_err(), "only configurationVersion 1 is defined");
     }
 
+    /// Bytes emitted by zenavif-serialize's HvcCBox for the same record this
+    /// module builds by hand. Pinned here so the two crates cannot drift apart
+    /// without one of them failing: the writer's own tests check these against
+    /// the spec's offsets, and this checks that the reader agrees.
+    #[test]
+    fn reads_what_the_serializer_writes() {
+        const WRITTEN: &[u8] = &[
+            0, 0, 0, 48, b'h', b'v', b'c', b'C', 1, 34, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 120, 240, 0,
+            252, 253, 250, 250, 0, 0, 15, 2, 160, 0, 1, 0, 3, 64, 1, 12, 33, 0, 1, 0, 4, 66, 1, 1,
+            96,
+        ];
+        let cfg = parse(WRITTEN).expect("the serializer's bytes must parse");
+        assert_eq!(cfg, parse(&hvcc_box(0x22, 1, 10, 10, 0x0F, &two_arrays())).unwrap());
+        assert!(cfg.general_tier_flag);
+        assert_eq!(cfg.general_profile_idc, 2);
+        assert_eq!(cfg.bit_depth_luma, 10);
+        assert_eq!(cfg.nal_length_size, 4);
+        assert_eq!(cfg.parameter_sets.len(), 2);
+    }
+
     /// A truncated array must fail rather than hand back a short parameter set.
     #[test]
     fn rejects_a_parameter_set_that_runs_past_the_box() {
