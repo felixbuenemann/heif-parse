@@ -2159,7 +2159,13 @@ impl<'data> AvifParser<'data> {
                 tile_ids.push(*tile_id).map_err(|e| at!(Error::from(e)))?;
             }
 
-            let grid_config = Self::calculate_grid_config(&meta, &tile_ids)?;
+            // The grid box is the derived item's payload, not a property of
+            // it, so it is read from the bytes the item points at. Falling
+            // back to inference only when that cannot be done keeps files
+            // that do carry it as a property working.
+            let grid_config = Self::read_grid_from_payload(raw.as_ref(), &parsed.mdat_bounds, meta.idat.as_ref(), &primary)
+                .unwrap_or(None)
+                .map_or_else(|| Self::calculate_grid_config(&meta, &tile_ids), Ok)?;
 
             // Enforce total_megapixels_limit on grid output dimensions on the
             // default zero-copy path (the eager path also calls this at
@@ -2581,6 +2587,51 @@ impl<'data> AvifParser<'data> {
     }
 
     /// Calculate grid configuration from metadata.
+    /// Read the `grid` box out of a grid item's own payload.
+    ///
+    /// Returns `None` rather than failing when the payload cannot be reached
+    /// or does not parse, so a malformed or unusual file falls back to
+    /// inference instead of being refused outright.
+    fn read_grid_from_payload(
+        raw: &[u8],
+        mdat_bounds: &[MdatBounds],
+        idat: Option<&TryVec<u8>>,
+        item: &ItemExtents,
+    ) -> Result<Option<GridConfig>> {
+        // A derived item's payload is small and commonly written into `idat`
+        // rather than `mdat` — libheif puts grid boxes there — so both
+        // constructions are read rather than only the file one.
+        let payload: std::vec::Vec<u8> = match item.construction_method {
+            ConstructionMethod::Idat => {
+                let Some(idat) = idat else { return Ok(None) };
+                let Some(extent) = item.extents.first() else { return Ok(None) };
+                let Ok(start) = usize::try_from(extent.start()) else { return Ok(None) };
+                let slice = match extent {
+                    ExtentRange::WithLength(range) => {
+                        let Ok(len) = usize::try_from(range.end - range.start) else {
+                            return Ok(None);
+                        };
+                        idat.get(start..start + len)
+                    }
+                    ExtentRange::ToEnd(_) => idat.get(start..),
+                };
+                let Some(slice) = slice else { return Ok(None) };
+                slice.to_vec()
+            }
+            _ => match Self::resolve_extents_from_raw(raw, mdat_bounds, item) {
+                Ok(payload) => payload,
+                Err(_) => return Ok(None),
+            },
+        };
+        // version(8) flags(8) rows_minus_one(8) columns_minus_one(8), then the
+        // output size at whichever width the flags chose.
+        if payload.len() < 8 {
+            return Ok(None);
+        }
+        let mut cursor = std::io::Cursor::new(payload.as_slice());
+        Ok(read_grid_payload(&mut cursor).ok())
+    }
+
     fn calculate_grid_config(meta: &AvifInternalMeta, tile_ids: &[u32]) -> Result<GridConfig> {
         // Try explicit grid property first
         for prop in &meta.properties {
@@ -6289,36 +6340,27 @@ fn extract_animation_frames(
 
 /// Parse an ImageGrid property box
 /// See ISO/IEC 23008-12:2017 § 6.6.2.3
-fn read_grid<T: Read>(src: &mut BMFFBox<'_, T>, _options: &ParseOptions) -> Result<GridConfig> {
-    // `grid` is NOT a FullBox. ISO/IEC 23008-12 § 6.6.2.3 gives it a one-byte
-    // version and a one-byte flags field, where a FullBox would have one and
-    // three. Reading it as a FullBox consumes two bytes too many and every
-    // field after lands on the wrong byte.
+/// Read a `grid` body: the same fields whether it arrived as a property box
+/// or as an item's payload, so both go through one reader.
+fn read_grid_payload<T: Read>(src: &mut T) -> Result<GridConfig> {
     let version = src.read_u8().map_err(|e| at!(Error::from(e)))?;
     if version > 0 {
         return Err(at!(Error::Unsupported("grid version > 0")));
     }
     let flags_byte = src.read_u8().map_err(|e| at!(Error::from(e)))?;
-
-    // Both counts are stored one less than they are, so a 2x2 grid writes 1
-    // and 1. Taking them literally halves the grid and leaves the tiles that
-    // fall outside it unread.
     let rows = src.read_u8().map_err(|e| at!(Error::from(e)))?.saturating_add(1);
     let columns = src.read_u8().map_err(|e| at!(Error::from(e)))?.saturating_add(1);
-
-    // Bit 0 of flags picks the field width: clear for 16-bit, set for 32-bit.
     let (output_width, output_height) = if flags_byte & 1 == 0 {
         (u32::from(be_u16(src)?), u32::from(be_u16(src)?))
     } else {
         (be_u32(src)?, be_u32(src)?)
     };
+    Ok(GridConfig { rows, columns, output_width, output_height })
+}
 
-    Ok(GridConfig {
-        rows,
-        columns,
-        output_width,
-        output_height,
-    })
+fn read_grid<T: Read>(src: &mut BMFFBox<'_, T>, _options: &ParseOptions) -> Result<GridConfig> {
+    // Same body as an item payload carries; only the wrapper differs.
+    read_grid_payload(src)
 }
 
 /// Parse an item location box inside a meta box
