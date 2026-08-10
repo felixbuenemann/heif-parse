@@ -2843,6 +2843,19 @@ impl<'data> AvifParser<'data> {
         self.hevc_config.as_ref()
     }
 
+    /// The HEVC configuration from the track's sample entry, if there is one.
+    ///
+    /// Distinct from [`Self::hevc_config`] on purpose. A file can hold both a
+    /// still item and a timed track, and their parameter sets need not match —
+    /// different profile, level or picture-order settings are all legal. The
+    /// item's record decodes items; only this one decodes track samples, and
+    /// using the wrong one lets an intra frame through while every inter frame
+    /// after it fails to parse.
+    #[must_use]
+    pub fn track_hevc_config(&self) -> Option<&HEVCConfig> {
+        self.animation_data.as_ref().and_then(|a| a.codec_config.hevc_config.as_ref())
+    }
+
     pub fn av1_config(&self) -> Option<&AV1Config> {
         self.av1_config.as_ref()
     }
