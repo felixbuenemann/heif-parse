@@ -966,6 +966,45 @@ pub struct AvifDepthMap {
     pub color_info: Option<ColorInformation>,
 }
 
+/// A thumbnail item, found through a `thmb` reference to the primary image.
+///
+/// Thumbnails are separate coded items at their own, smaller size — not a
+/// scaled view of the primary one. A reader that wants a small rendition can
+/// decode one of these instead of the full image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThumbnailInfo {
+    /// Item id of the thumbnail itself.
+    pub item_id: u32,
+    /// Coded width in pixels, from the thumbnail's own `ispe`.
+    ///
+    /// This is what the codec coded, not necessarily what is meant to be
+    /// shown: HEVC pads to its alignment, so a 32x20 thumbnail can be coded
+    /// at 64x64. [`Self::display_size`] applies the clean aperture below.
+    pub width: u32,
+    /// Coded height in pixels, from the thumbnail's own `ispe`.
+    pub height: u32,
+    /// The thumbnail's own `clap`, if it carries one.
+    pub clean_aperture: Option<CleanAperture>,
+}
+
+impl ThumbnailInfo {
+    /// The size this thumbnail is meant to be shown at.
+    ///
+    /// The clean aperture where there is one, and the coded size otherwise.
+    /// A caller picking a thumbnail by size wants this rather than the coded
+    /// dimensions, which can be substantially larger.
+    #[must_use]
+    pub fn display_size(&self) -> (u32, u32) {
+        match self.clean_aperture {
+            Some(clap) if clap.width_d != 0 && clap.height_d != 0 => (
+                (clap.width_n / clap.width_d).max(1),
+                (clap.height_n / clap.height_d).max(1),
+            ),
+            _ => (self.width, self.height),
+        }
+    }
+}
+
 /// Operating point selector from the `a1op` property box.
 ///
 /// Selects which AV1 operating point to decode for multi-operating-point images.
@@ -1645,6 +1684,7 @@ pub struct AvifParser<'data> {
     alpha: Option<ItemExtents>,
     grid_config: Option<GridConfig>,
     tiles: TryVec<ItemExtents>,
+    thumbnails: TryVec<(ThumbnailInfo, ItemExtents)>,
     animation_data: Option<AnimationParserData>,
     premultiplied_alpha: bool,
     spatial_extents: Option<ImageSpatialExtents>,
@@ -1891,6 +1931,7 @@ impl<'data> AvifParser<'data> {
                 alpha: None,
                 grid_config: None,
                 tiles: TryVec::new(),
+                thumbnails: TryVec::new(),
                 animation_data,
                 premultiplied_alpha: false,
                 spatial_extents: None,
@@ -2053,6 +2094,40 @@ impl<'data> AvifParser<'data> {
             .iter()
             .find(|x| x.item_id == meta.primary_item_id)
             .is_some_and(|info| info.item_type == b"grid");
+
+        // Thumbnails reference the image they stand in for, so the reference
+        // runs from the thumbnail to the primary item, not the other way.
+        let mut thumbnails: TryVec<(ThumbnailInfo, ItemExtents)> = TryVec::new();
+        for iref in meta.item_references.iter() {
+            if iref.to_item_id != meta.primary_item_id || iref.item_type != b"thmb" {
+                continue;
+            }
+            let item_id = iref.from_item_id;
+            // A thumbnail of itself would be a reference cycle, and decoding
+            // it as a small rendition would mean decoding the full image.
+            if item_id == meta.primary_item_id {
+                continue;
+            }
+            let (width, height) = meta
+                .properties
+                .iter()
+                .find_map(|p| match (&p.property, p.item_id == item_id) {
+                    (ItemProperty::ImageSpatialExtents(e), true) => Some((e.width, e.height)),
+                    _ => None,
+                })
+                .unwrap_or((0, 0));
+            let clean_aperture = meta
+                .properties
+                .iter()
+                .find_map(|p| match (&p.property, p.item_id == item_id) {
+                    (ItemProperty::CleanAperture(c), true) => Some(*c),
+                    _ => None,
+                });
+            let extents = Self::get_item_extents(&meta, item_id)?;
+            thumbnails
+                .push((ThumbnailInfo { item_id, width, height, clean_aperture }, extents))
+                .map_err(|e| at!(Error::from(e)))?;
+        }
 
         // Extract grid configuration and tile extents if this is a grid
         let (grid_config, tiles) = if is_grid {
@@ -2240,6 +2315,7 @@ impl<'data> AvifParser<'data> {
             alpha,
             grid_config,
             tiles,
+            thumbnails,
             animation_data,
             premultiplied_alpha,
             spatial_extents,
@@ -2600,6 +2676,29 @@ impl<'data> AvifParser<'data> {
     pub fn tile_data(&self, index: usize) -> Result<Cow<'_, [u8]>> {
         let item = self.tiles.get(index)
             .ok_or_else(|| at!(Error::InvalidData("tile index out of bounds")))?;
+        self.resolve_item(item)
+    }
+
+    /// Thumbnail items that stand in for the primary image, in the order the
+    /// `thmb` references were written.
+    ///
+    /// Each is a separately coded image at its own size, so a caller wanting a
+    /// small rendition can decode one of these rather than the full image.
+    #[must_use]
+    pub fn thumbnails(&self) -> impl Iterator<Item = ThumbnailInfo> + '_ {
+        self.thumbnails.iter().map(|(info, _)| *info)
+    }
+
+    /// How many thumbnail items reference the primary image.
+    #[must_use]
+    pub fn thumbnail_count(&self) -> usize {
+        self.thumbnails.len()
+    }
+
+    /// Coded bytes of one thumbnail, indexed as [`Self::thumbnails`] yields them.
+    pub fn thumbnail_data(&self, index: usize) -> Result<Cow<'_, [u8]>> {
+        let (_, item) = self.thumbnails.get(index)
+            .ok_or_else(|| at!(Error::InvalidData("thumbnail index out of bounds")))?;
         self.resolve_item(item)
     }
 
