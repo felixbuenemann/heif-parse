@@ -139,6 +139,7 @@ box_database!(
     AVCSampleEntry                    0x6176_6331, // "avc1"
     AVC3SampleEntry                   0x6176_6333, // "avc3" - Need to check official name in spec.
     AVCConfigurationBox               0x6176_6343, // "avcC"
+    HEVCCodecConfigurationBox         0x6876_6343, // "hvcC"
     MP4AudioSampleEntry               0x6d70_3461, // "mp4a"
     MP4VideoSampleEntry               0x6d70_3476, // "mp4v"
     ESDBox                            0x6573_6473, // "esds"

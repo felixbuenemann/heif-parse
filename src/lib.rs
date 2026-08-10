@@ -465,6 +465,95 @@ pub struct AV1Config {
     pub chroma_sample_position: u8,
 }
 
+/// One parameter-set NAL unit carried in the `hvcC` record.
+///
+/// Stored as a bare NAL unit: no length prefix and no Annex B start code, the
+/// same shape the record itself uses. A decoder must be given these before the
+/// item payload, since VPS/SPS/PPS live here rather than in the coded data.
+#[derive(Debug, PartialEq)]
+pub struct HevcParameterSet {
+    /// NAL unit type, six bits (32 = VPS, 33 = SPS, 34 = PPS, 39/40 = SEI).
+    pub nal_unit_type: u8,
+    /// Whether the record claims to hold every NAL of this type in the stream.
+    pub array_completeness: bool,
+    /// The NAL unit, header included.
+    pub data: TryVec<u8>,
+}
+
+impl TryClone for HevcParameterSet {
+    fn try_clone(&self) -> Result<Self, TryReserveError> {
+        Ok(Self {
+            nal_unit_type: self.nal_unit_type,
+            array_completeness: self.array_completeness,
+            data: self.data.try_clone()?,
+        })
+    }
+}
+
+/// HEVC codec configuration from the `hvcC` property box.
+///
+/// The HEIF counterpart of [`AV1Config`]: what `av1C` states in packed bits,
+/// `hvcC` states in named fields, plus the parameter sets AV1 keeps in its
+/// sequence header. See ISO/IEC 14496-15 § 8.3.3.1.
+#[derive(Debug, PartialEq)]
+pub struct HEVCConfig {
+    /// `general_profile_space`, two bits.
+    pub general_profile_space: u8,
+    /// `general_tier_flag`: false = Main tier, true = High tier.
+    pub general_tier_flag: bool,
+    /// `general_profile_idc` (1 = Main, 2 = Main 10, 3 = Main Still Picture).
+    pub general_profile_idc: u8,
+    /// `general_level_idc`, thirty times the level number.
+    pub general_level_idc: u8,
+    /// `chroma_format_idc` (0 = monochrome, 1 = 4:2:0, 2 = 4:2:2, 3 = 4:4:4).
+    pub chroma_format_idc: u8,
+    /// Luma bit depth (8, 10, 12 or 16).
+    pub bit_depth_luma: u8,
+    /// Chroma bit depth (8, 10, 12 or 16).
+    pub bit_depth_chroma: u8,
+    /// Bytes of the length prefix on each NAL unit in the item payload (1, 2 or 4).
+    pub nal_length_size: u8,
+    /// VPS, SPS, PPS and any SEI the record carries, in the order written.
+    pub parameter_sets: TryVec<HevcParameterSet>,
+}
+
+impl HEVCConfig {
+    /// Whether the stream has no chroma planes.
+    #[must_use]
+    pub fn monochrome(&self) -> bool {
+        self.chroma_format_idc == 0
+    }
+
+    /// Chroma subsampling, in the sense [`AV1Config`] reports it.
+    ///
+    /// Monochrome has no chroma to subsample and reads as `(false, false)`,
+    /// matching how `av1C` pairs `monochrome` with cleared subsampling bits.
+    #[must_use]
+    pub fn chroma_subsampling(&self) -> ChromaSubsampling {
+        match self.chroma_format_idc {
+            1 => ChromaSubsampling { horizontal: true, vertical: true },
+            2 => ChromaSubsampling { horizontal: true, vertical: false },
+            _ => ChromaSubsampling { horizontal: false, vertical: false },
+        }
+    }
+}
+
+impl TryClone for HEVCConfig {
+    fn try_clone(&self) -> Result<Self, TryReserveError> {
+        Ok(Self {
+            general_profile_space: self.general_profile_space,
+            general_tier_flag: self.general_tier_flag,
+            general_profile_idc: self.general_profile_idc,
+            general_level_idc: self.general_level_idc,
+            chroma_format_idc: self.chroma_format_idc,
+            bit_depth_luma: self.bit_depth_luma,
+            bit_depth_chroma: self.bit_depth_chroma,
+            nal_length_size: self.nal_length_size,
+            parameter_sets: self.parameter_sets.try_clone()?,
+        })
+    }
+}
+
 /// Colour information from the `colr` property box.
 ///
 /// Can be either CICP-based (`nclx`) or an ICC profile (`rICC`/`prof`).
@@ -4552,6 +4641,7 @@ pub(crate) enum ItemProperty {
     ImageSpatialExtents(ImageSpatialExtents),
     ImageGrid(GridConfig),
     AV1Config(AV1Config),
+    HEVCConfig(HEVCConfig),
     ColorInformation(ColorInformation),
     Rotation(ImageRotation),
     Mirror(ImageMirror),
@@ -4575,6 +4665,7 @@ impl TryClone for ItemProperty {
             Self::ImageSpatialExtents(val) => Self::ImageSpatialExtents(*val),
             Self::ImageGrid(val) => Self::ImageGrid(val.clone()),
             Self::AV1Config(val) => Self::AV1Config(val.clone()),
+            Self::HEVCConfig(val) => Self::HEVCConfig(val.try_clone()?),
             Self::ColorInformation(val) => Self::ColorInformation(val.clone()),
             Self::Rotation(val) => Self::Rotation(*val),
             Self::Mirror(val) => Self::Mirror(*val),
@@ -4659,6 +4750,7 @@ fn read_ipco<T: Read>(src: &mut BMFFBox<'_, T>, options: &ParseOptions) -> Resul
             BoxType::ImageSpatialExtentsBox => ItemProperty::ImageSpatialExtents(read_ispe(&mut b, options)?),
             BoxType::ImageGridBox => ItemProperty::ImageGrid(read_grid(&mut b, options)?),
             BoxType::AV1CodecConfigurationBox => ItemProperty::AV1Config(read_av1c(&mut b)?),
+            BoxType::HEVCCodecConfigurationBox => ItemProperty::HEVCConfig(read_hvcc(&mut b)?),
             BoxType::ColorInformationBox => {
                 match read_colr(&mut b) {
                     Ok(colr) => ItemProperty::ColorInformation(colr),
@@ -4806,6 +4898,210 @@ fn read_av1c<T: Read>(src: &mut BMFFBox<'_, T>) -> Result<AV1Config> {
         chroma_subsampling_y,
         chroma_sample_position,
     })
+}
+
+/// Parse an HEVC Decoder Configuration Record
+/// See ISO/IEC 14496-15 § 8.3.3.1
+fn read_hvcc<T: Read>(src: &mut BMFFBox<'_, T>) -> Result<HEVCConfig> {
+    // hvcC is NOT a FullBox — the first byte is the record's own version.
+    let configuration_version = src.read_u8().map_err(|e| at!(Error::from(e)))?;
+    if configuration_version != 1 {
+        return Err(at!(Error::Unsupported("hvcC configurationVersion must be 1")));
+    }
+
+    let byte1 = src.read_u8().map_err(|e| at!(Error::from(e)))?;
+    let general_profile_space = byte1 >> 6;
+    let general_tier_flag = (byte1 >> 5) & 1 != 0;
+    let general_profile_idc = byte1 & 0x1F;
+
+    // general_profile_compatibility_flags (32) and
+    // general_constraint_indicator_flags (48) describe conformance, not the
+    // pixel format, and nothing here needs them.
+    skip(src, 4 + 6)?;
+
+    let general_level_idc = src.read_u8().map_err(|e| at!(Error::from(e)))?;
+
+    // min_spatial_segmentation_idc (4 reserved + 12) and parallelismType
+    // (6 reserved + 2) describe how the stream may be split for parallel
+    // decode. The decoder rediscovers that from the SPS/PPS.
+    skip(src, 3)?;
+
+    // Each of the next three bytes is reserved bits followed by a small field.
+    let chroma_format_idc = src.read_u8().map_err(|e| at!(Error::from(e)))? & 0x03;
+    let bit_depth_luma = (src.read_u8().map_err(|e| at!(Error::from(e)))? & 0x07) + 8;
+    let bit_depth_chroma = (src.read_u8().map_err(|e| at!(Error::from(e)))? & 0x07) + 8;
+
+    // avgFrameRate (16) is a still-image irrelevance.
+    skip(src, 2)?;
+
+    // constantFrameRate (2) | numTemporalLayers (3) | temporalIdNested (1) |
+    // lengthSizeMinusOne (2)
+    let byte21 = src.read_u8().map_err(|e| at!(Error::from(e)))?;
+    let nal_length_size = (byte21 & 0x03) + 1;
+    if nal_length_size == 3 {
+        // lengthSizeMinusOne == 2 is not a legal encoding; a three-byte prefix
+        // would silently misframe every NAL in the payload.
+        return Err(at!(Error::InvalidData("hvcC lengthSizeMinusOne must be 0, 1 or 3")));
+    }
+
+    let num_arrays = src.read_u8().map_err(|e| at!(Error::from(e)))?;
+    let mut parameter_sets = TryVec::new();
+    for _ in 0..num_arrays {
+        let head = src.read_u8().map_err(|e| at!(Error::from(e)))?;
+        let array_completeness = head >> 7 != 0;
+        let nal_unit_type = head & 0x3F;
+
+        let num_nalus = be_u16(src)?;
+        for _ in 0..num_nalus {
+            let nal_length = usize::from(be_u16(src)?);
+            let mut data = TryVec::new();
+            data.resize_with(nal_length, || 0u8).map_err(|e| at!(Error::from(e)))?;
+            src.read_exact(&mut data)
+                .map_err(|_| at!(Error::InvalidData("hvcC parameter set runs past the box")))?;
+            parameter_sets
+                .push(HevcParameterSet { nal_unit_type, array_completeness, data })
+                .map_err(|e| at!(Error::from(e)))?;
+        }
+    }
+
+    // Some writers pad the record; the box bound is what limits us, and the
+    // arrays above are already read.
+    skip_box_remain(src)?;
+
+    Ok(HEVCConfig {
+        general_profile_space,
+        general_tier_flag,
+        general_profile_idc,
+        general_level_idc,
+        chroma_format_idc,
+        bit_depth_luma,
+        bit_depth_chroma,
+        nal_length_size,
+        parameter_sets,
+    })
+}
+
+#[cfg(test)]
+mod hvcc_tests {
+    use super::*;
+
+    /// Build an `hvcC` box around the given fixed-header tail and arrays.
+    fn hvcc_box(byte1: u8, chroma: u8, luma_depth: u8, chroma_depth: u8, byte21: u8, arrays: &[u8]) -> std::vec::Vec<u8> {
+        let mut record = std::vec::Vec::new();
+        record.push(1); // configurationVersion
+        record.push(byte1); // profile_space | tier | profile_idc
+        record.extend_from_slice(&[0u8; 4]); // general_profile_compatibility_flags
+        record.extend_from_slice(&[0u8; 6]); // general_constraint_indicator_flags
+        record.push(120); // general_level_idc, level 4.0
+        record.extend_from_slice(&[0xF0, 0x00]); // reserved | min_spatial_segmentation_idc
+        record.push(0xFC); // reserved | parallelismType
+        record.push(0xFC | chroma); // reserved | chroma_format_idc
+        record.push(0xF8 | (luma_depth - 8)); // reserved | bit_depth_luma_minus8
+        record.push(0xF8 | (chroma_depth - 8)); // reserved | bit_depth_chroma_minus8
+        record.extend_from_slice(&[0, 0]); // avgFrameRate
+        record.push(byte21);
+        record.extend_from_slice(arrays);
+
+        let mut bytes = std::vec::Vec::new();
+        bytes.extend_from_slice(&((record.len() + 8) as u32).to_be_bytes());
+        bytes.extend_from_slice(b"hvcC");
+        bytes.extend_from_slice(&record);
+        bytes
+    }
+
+    fn parse(bytes: &[u8]) -> Result<HEVCConfig> {
+        let mut cursor = std::io::Cursor::new(bytes);
+        let total = bytes.len() as u64;
+        let mut iter = BoxIter::with_max_remaining(&mut cursor, total);
+        let mut b = iter.next_box().expect("iter").expect("hvcC box");
+        read_hvcc(&mut b)
+    }
+
+    /// One VPS and one SPS array, the shape every real HEIC carries.
+    fn two_arrays() -> std::vec::Vec<u8> {
+        let mut a = std::vec::Vec::new();
+        a.push(0x80 | 32); // array_completeness | VPS
+        a.extend_from_slice(&1u16.to_be_bytes());
+        a.extend_from_slice(&3u16.to_be_bytes());
+        a.extend_from_slice(&[0x40, 0x01, 0x0C]);
+        a.push(33); // SPS, not marked complete
+        a.extend_from_slice(&1u16.to_be_bytes());
+        a.extend_from_slice(&4u16.to_be_bytes());
+        a.extend_from_slice(&[0x42, 0x01, 0x01, 0x60]);
+        let mut out = std::vec::Vec::new();
+        out.push(2); // numOfArrays
+        out.extend_from_slice(&a);
+        out
+    }
+
+    #[test]
+    fn reads_a_main10_record_with_its_parameter_sets() {
+        // profile_space 0, High tier, profile_idc 2 (Main 10); 4:2:0; 10-bit;
+        // lengthSizeMinusOne 3 so NALs carry four-byte prefixes.
+        let bytes = hvcc_box(0x22, 1, 10, 10, 0x0F, &two_arrays());
+        let cfg = parse(&bytes).expect("hvcC parses");
+
+        assert_eq!(cfg.general_profile_space, 0);
+        assert!(cfg.general_tier_flag, "High tier");
+        assert_eq!(cfg.general_profile_idc, 2);
+        assert_eq!(cfg.general_level_idc, 120);
+        assert_eq!(cfg.chroma_format_idc, 1);
+        assert_eq!(cfg.bit_depth_luma, 10);
+        assert_eq!(cfg.bit_depth_chroma, 10);
+        assert_eq!(cfg.nal_length_size, 4);
+
+        assert_eq!(cfg.parameter_sets.len(), 2, "VPS and SPS");
+        assert_eq!(cfg.parameter_sets[0].nal_unit_type, 32);
+        assert!(cfg.parameter_sets[0].array_completeness);
+        assert_eq!(cfg.parameter_sets[0].data.as_slice(), &[0x40, 0x01, 0x0C]);
+        assert_eq!(cfg.parameter_sets[1].nal_unit_type, 33);
+        assert!(!cfg.parameter_sets[1].array_completeness);
+        assert_eq!(cfg.parameter_sets[1].data.as_slice(), &[0x42, 0x01, 0x01, 0x60]);
+    }
+
+    #[test]
+    fn chroma_format_idc_maps_onto_av1c_style_subsampling() {
+        for (idc, mono, horizontal, vertical) in
+            [(0u8, true, false, false), (1, false, true, true), (2, false, true, false), (3, false, false, false)]
+        {
+            let bytes = hvcc_box(0x01, idc, 8, 8, 0x0F, &[0]);
+            let cfg = parse(&bytes).expect("hvcC parses");
+            assert_eq!(cfg.monochrome(), mono, "chroma_format_idc {idc}");
+            assert_eq!(
+                cfg.chroma_subsampling(),
+                ChromaSubsampling { horizontal, vertical },
+                "chroma_format_idc {idc}"
+            );
+        }
+    }
+
+    /// lengthSizeMinusOne == 2 is not a legal encoding. Accepting it would
+    /// frame every NAL in the payload three bytes at a time.
+    #[test]
+    fn rejects_the_reserved_nal_length_size() {
+        let bytes = hvcc_box(0x01, 1, 8, 8, 0x0E, &[0]);
+        assert!(parse(&bytes).is_err(), "lengthSizeMinusOne 2 must be rejected");
+    }
+
+    #[test]
+    fn rejects_a_record_whose_version_is_not_one() {
+        let mut bytes = hvcc_box(0x01, 1, 8, 8, 0x0F, &[0]);
+        bytes[8] = 2; // configurationVersion
+        assert!(parse(&bytes).is_err(), "only configurationVersion 1 is defined");
+    }
+
+    /// A truncated array must fail rather than hand back a short parameter set.
+    #[test]
+    fn rejects_a_parameter_set_that_runs_past_the_box() {
+        let mut arrays = std::vec::Vec::new();
+        arrays.push(1); // numOfArrays
+        arrays.push(32); // VPS
+        arrays.extend_from_slice(&1u16.to_be_bytes());
+        arrays.extend_from_slice(&64u16.to_be_bytes()); // claims 64 bytes
+        arrays.extend_from_slice(&[0x40, 0x01]); // supplies 2
+        let bytes = hvcc_box(0x01, 1, 8, 8, 0x0F, &arrays);
+        assert!(parse(&bytes).is_err(), "a NAL running past the box must fail");
+    }
 }
 
 /// Parse a Colour Information property box
