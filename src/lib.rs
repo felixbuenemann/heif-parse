@@ -1196,6 +1196,8 @@ pub struct AnimationFrame {
     /// AV1 bitstream data for this frame
     pub data: TryVec<u8>,
     /// Duration in milliseconds (0 if unknown)
+    /// Duration in timescale ticks, exact where `duration_ms` rounds.
+    pub duration_ticks: u32,
     pub duration_ms: u32,
 }
 
@@ -1636,6 +1638,12 @@ pub struct FrameRef<'a> {
     pub data: Cow<'a, [u8]>,
     /// Alpha channel data for this frame, if the animation has a separate alpha track.
     pub alpha_data: Option<Cow<'a, [u8]>>,
+    /// Duration in the track's own timescale ticks, exactly as written.
+    ///
+    /// [`Self::duration_ms`] is this divided into milliseconds, which is lossy
+    /// whenever the timescale does not divide 1000 — 1001-based film rates
+    /// among them. A caller reproducing timing losslessly wants this.
+    pub duration_ticks: u32,
     pub duration_ms: u32,
 }
 
@@ -2520,7 +2528,8 @@ impl<'data> AvifParser<'data> {
             return Err(at!(Error::InvalidData("frame index out of bounds")));
         }
 
-        let duration_ms = self.calculate_frame_duration(&anim.sample_table, anim.media_timescale, index)?;
+        let (duration_ticks, duration_ms) =
+            self.calculate_frame_duration(&anim.sample_table, anim.media_timescale, index)?;
         let (offset, size) = self.calculate_sample_location(&anim.sample_table, index)?;
 
         let start = usize::try_from(offset).map_err(|e| at!(Error::from(e)))?;
@@ -2554,6 +2563,7 @@ impl<'data> AvifParser<'data> {
         Ok(FrameRef {
             data: Cow::Borrowed(slice),
             alpha_data,
+            duration_ticks,
             duration_ms,
         })
     }
@@ -2622,7 +2632,7 @@ impl<'data> AvifParser<'data> {
         st: &SampleTable,
         timescale: u32,
         index: usize,
-    ) -> Result<u32> {
+    ) -> Result<(u32, u32)> {
         let mut current_sample: usize = 0;
         for entry in &st.time_to_sample {
             // `sample_count` is attacker-controlled (stts box). Use saturating
@@ -2636,11 +2646,14 @@ impl<'data> AvifParser<'data> {
                 } else {
                     0
                 };
-                return Ok(u32::try_from(duration_ms).unwrap_or(u32::MAX));
+                return Ok((
+                    entry.sample_delta,
+                    u32::try_from(duration_ms).unwrap_or(u32::MAX),
+                ));
             }
             current_sample = current_sample.saturating_add(entry.sample_count as usize);
         }
-        Ok(0)
+        Ok((0, 0))
     }
 
     /// Look up precomputed sample location (offset and size) from sample table.
@@ -3010,7 +3023,11 @@ impl<'data> AvifParser<'data> {
                 let frame_ref = self.frame(i)?;
                 let mut data = TryVec::new();
                 data.extend_from_slice(&frame_ref.data).map_err(|e| at!(Error::from(e)))?;
-                frames.push(AnimationFrame { data, duration_ms: frame_ref.duration_ms }).map_err(|e| at!(Error::from(e)))?;
+                frames.push(AnimationFrame {
+                    data,
+                    duration_ticks: frame_ref.duration_ticks,
+                    duration_ms: frame_ref.duration_ms,
+                }).map_err(|e| at!(Error::from(e)))?;
             }
             Some(AnimationConfig {
                 loop_count: info.loop_count,
@@ -6210,7 +6227,9 @@ fn extract_animation_frames(
             } else {
                 0
             };
-            frame_durations.push(u32::try_from(duration_ms).unwrap_or(u32::MAX)).map_err(|e| at!(Error::from(e)))?;
+            frame_durations
+                .push((entry.sample_delta, u32::try_from(duration_ms).unwrap_or(u32::MAX)))
+                .map_err(|e| at!(Error::from(e)))?;
         }
     }
 
@@ -6220,7 +6239,7 @@ fn extract_animation_frames(
             .ok_or_else(|| at!(Error::InvalidData("sample offset index out of bounds")))?;
         let sample_size = sample_table.sample_sizes.get(i)
             .ok_or_else(|| at!(Error::InvalidData("sample size index out of bounds")))?;
-        let duration_ms = frame_durations.get(i).copied().unwrap_or(0);
+        let (duration_ticks, duration_ms) = frame_durations.get(i).copied().unwrap_or((0, 0));
 
         let mut frame_data = TryVec::new();
         let mut found = false;
@@ -6248,6 +6267,7 @@ fn extract_animation_frames(
 
         frames.push(AnimationFrame {
             data: frame_data,
+            duration_ticks,
             duration_ms,
         }).map_err(|e| at!(Error::from(e)))?;
     }
