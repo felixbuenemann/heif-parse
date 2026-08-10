@@ -1635,6 +1635,7 @@ pub struct AvifParser<'data> {
     premultiplied_alpha: bool,
     spatial_extents: Option<ImageSpatialExtents>,
     av1_config: Option<AV1Config>,
+    hevc_config: Option<HEVCConfig>,
     color_info: Option<ColorInformation>,
     rotation: Option<ImageRotation>,
     mirror: Option<ImageMirror>,
@@ -1780,8 +1781,10 @@ impl<'data> AvifParser<'data> {
         let (major_brand, compatible_brands) = if let Some(mut b) = iter.next_box()? {
             if b.head.name == BoxType::FileTypeBox {
                 let ftyp = read_ftyp(&mut b)?;
-                if ftyp.major_brand != b"avif" && ftyp.major_brand != b"avis" {
-                    return Err(at!(Error::InvalidData("ftyp must be 'avif' or 'avis'")));
+                if !is_supported_brand(&ftyp.major_brand)
+                    && !ftyp.compatible_brands.iter().any(is_supported_brand)
+                {
+                    return Err(at!(Error::InvalidData("ftyp names no brand this parser reads")));
                 }
                 let major = ftyp.major_brand.value;
                 let compat = ftyp.compatible_brands.iter().map(|b| b.value).collect();
@@ -1876,6 +1879,9 @@ impl<'data> AvifParser<'data> {
                 premultiplied_alpha: false,
                 spatial_extents: None,
                 av1_config: track_config.av1_config,
+                // Sample entries do not carry hvcC yet, so a track-only file
+                // has no HEVC configuration to report.
+                hevc_config: None,
                 color_info: track_config.color_info,
                 rotation: None,
                 mirror: None,
@@ -2175,6 +2181,17 @@ impl<'data> AvifParser<'data> {
         let spatial_extents = find_prop!(ImageSpatialExtents);
         let av1_config = find_prop!(AV1Config)
             .or_else(|| track_config.and_then(|c| c.av1_config.clone()));
+        // HEVCConfig owns its parameter sets, so it try_clones rather than
+        // clones and cannot ride the macro above.
+        let hevc_config = meta
+            .properties
+            .iter()
+            .find_map(|p| match (&p.property, p.item_id == meta.primary_item_id) {
+                (ItemProperty::HEVCConfig(c), true) => Some(c.try_clone()),
+                _ => None,
+            })
+            .transpose()
+            .map_err(|e| at!(Error::from(e)))?;
         let color_info = find_prop!(ColorInformation)
             .or_else(|| track_config.and_then(|c| c.color_info.clone()));
         let rotation = find_prop!(Rotation);
@@ -2210,6 +2227,7 @@ impl<'data> AvifParser<'data> {
             premultiplied_alpha,
             spatial_extents,
             av1_config,
+            hevc_config,
             color_info,
             rotation,
             mirror,
@@ -2623,6 +2641,16 @@ impl<'data> AvifParser<'data> {
     /// Get the AV1 codec configuration for the primary item, if present.
     ///
     /// This is parsed from the `av1C` property box in the container.
+    /// HEVC codec configuration from the container's `hvcC` property.
+    ///
+    /// Present on HEVC-coded items and absent on AV1 ones, so it is the
+    /// mirror of [`Self::av1_config`] rather than an addition to it: a
+    /// well-formed file sets exactly one of the two.
+    #[must_use]
+    pub fn hevc_config(&self) -> Option<&HEVCConfig> {
+        self.hevc_config.as_ref()
+    }
+
     pub fn av1_config(&self) -> Option<&AV1Config> {
         self.av1_config.as_ref()
     }
@@ -4394,10 +4422,9 @@ fn read_avif_meta<T: Read + Offset>(src: &mut BMFFBox<'_, T>, options: &ParseOpt
     let item_infos = item_infos.ok_or_else(|| at!(Error::InvalidData("iinf missing")))?;
 
     if let Some(item_info) = item_infos.iter().find(|x| x.item_id == primary_item_id) {
-        // Allow both "av01" (standard single-frame) and "grid" (tiled) types
-        if item_info.item_type != b"av01" && item_info.item_type != b"grid" {
+        if !is_image_item_type(&item_info.item_type) {
             warn!("primary_item_id type: {}", item_info.item_type);
-            return Err(at!(Error::InvalidData("primary_item_id type is not av01 or grid")));
+            return Err(at!(Error::InvalidData("primary item is not a coded image or grid")));
         }
     } else {
         return Err(at!(Error::InvalidData("primary_item_id not present in iinf box")));
@@ -4412,6 +4439,33 @@ fn read_avif_meta<T: Read + Offset>(src: &mut BMFFBox<'_, T>, options: &ParseOpt
         idat,
         entity_groups,
     })
+}
+
+/// Whether a brand names a file this parser can read items out of.
+///
+/// Both brand lists are worth testing: a HEIC written by a phone commonly
+/// declares the generic MIAF brand as major and names `heic` only among the
+/// compatible brands, so majors alone would turn those files away.
+fn is_supported_brand(brand: &FourCC) -> bool {
+    matches!(
+        &brand.value,
+        // AV1 still image and sequence
+        b"avif" | b"avis"
+        // HEVC still image
+        | b"heic" | b"heix" | b"heim" | b"heis"
+        // HEVC sequence
+        | b"hevc" | b"hevx" | b"hevm" | b"hevs"
+        // MIAF, naming the shape without naming the codec
+        | b"mif1" | b"msf1"
+    )
+}
+
+/// Whether an item type holds coded image data this parser can locate.
+///
+/// `grid` is a derived item rather than a coded one; it earns its place here
+/// because it is a legal primary item, with its tiles referenced from it.
+fn is_image_item_type(item_type: &FourCC) -> bool {
+    matches!(&item_type.value, b"av01" | b"hvc1" | b"hev1" | b"grid")
 }
 
 /// Parse a Handler Reference Box
@@ -4979,6 +5033,53 @@ fn read_hvcc<T: Read>(src: &mut BMFFBox<'_, T>) -> Result<HEVCConfig> {
         nal_length_size,
         parameter_sets,
     })
+}
+
+#[cfg(test)]
+mod brand_and_item_type_tests {
+    use super::*;
+
+    fn cc(v: &[u8; 4]) -> FourCC {
+        FourCC { value: *v }
+    }
+
+    #[test]
+    fn av1_and_hevc_brands_are_both_read() {
+        for b in [b"avif", b"avis", b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevx", b"hevm", b"hevs"] {
+            assert!(is_supported_brand(&cc(b)), "{} should be read", std::str::from_utf8(b).unwrap());
+        }
+    }
+
+    /// A phone's HEIC declares `mif1` major and names `heic` only among the
+    /// compatible brands, so the generic MIAF brands have to be admitted too.
+    #[test]
+    fn the_generic_miaf_brands_are_read() {
+        assert!(is_supported_brand(&cc(b"mif1")));
+        assert!(is_supported_brand(&cc(b"msf1")));
+    }
+
+    #[test]
+    fn unrelated_iso_media_brands_stay_out() {
+        for b in [b"isom", b"mp42", b"qt  ", b"crx ", b"jxl "] {
+            assert!(!is_supported_brand(&cc(b)), "{} should not be read", std::str::from_utf8(b).unwrap());
+        }
+    }
+
+    #[test]
+    fn coded_image_items_and_grid_are_image_items() {
+        for t in [b"av01", b"hvc1", b"hev1", b"grid"] {
+            assert!(is_image_item_type(&cc(t)), "{} should be an image item", std::str::from_utf8(t).unwrap());
+        }
+    }
+
+    /// Metadata and derived-but-not-coded items must not pass as the primary
+    /// image; `tmap` in particular is a real sibling item in gain-map files.
+    #[test]
+    fn metadata_and_tone_map_items_are_not_image_items() {
+        for t in [b"Exif", b"mime", b"tmap", b"uri ", b"iovl"] {
+            assert!(!is_image_item_type(&cc(t)), "{} should not be an image item", std::str::from_utf8(t).unwrap());
+        }
+    }
 }
 
 #[cfg(test)]
