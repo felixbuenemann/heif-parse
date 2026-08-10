@@ -2289,6 +2289,18 @@ impl<'data> AvifParser<'data> {
                 _ => None,
             })
             .or_else(|| track_config.and_then(|c| c.hevc_config.as_ref()))
+            // A `grid` carries no codec configuration of its own; the property
+            // sits on the tiles. HEVC cannot recover it from the coded data
+            // either, because its parameter sets live in the container rather
+            // than the stream — so without this a grid HEIC is undecodable.
+            // The tiles of a grid share one configuration, which is what makes
+            // taking the first sound.
+            .or_else(|| {
+                meta.properties.iter().find_map(|p| match &p.property {
+                    ItemProperty::HEVCConfig(c) => Some(c),
+                    _ => None,
+                })
+            })
             .map(TryClone::try_clone)
             .transpose()
             .map_err(|e| at!(Error::from(e)))?;
@@ -6277,22 +6289,27 @@ fn extract_animation_frames(
 
 /// Parse an ImageGrid property box
 /// See ISO/IEC 23008-12:2017 § 6.6.2.3
-fn read_grid<T: Read>(src: &mut BMFFBox<'_, T>, options: &ParseOptions) -> Result<GridConfig> {
-    let version = read_fullbox_version_no_flags(src, options)?;
+fn read_grid<T: Read>(src: &mut BMFFBox<'_, T>, _options: &ParseOptions) -> Result<GridConfig> {
+    // `grid` is NOT a FullBox. ISO/IEC 23008-12 § 6.6.2.3 gives it a one-byte
+    // version and a one-byte flags field, where a FullBox would have one and
+    // three. Reading it as a FullBox consumes two bytes too many and every
+    // field after lands on the wrong byte.
+    let version = src.read_u8().map_err(|e| at!(Error::from(e)))?;
     if version > 0 {
         return Err(at!(Error::Unsupported("grid version > 0")));
     }
-
     let flags_byte = src.read_u8().map_err(|e| at!(Error::from(e)))?;
-    let rows = src.read_u8().map_err(|e| at!(Error::from(e)))?;
-    let columns = src.read_u8().map_err(|e| at!(Error::from(e)))?;
 
-    // flags & 1 determines field size: 0 = 16-bit, 1 = 32-bit
+    // Both counts are stored one less than they are, so a 2x2 grid writes 1
+    // and 1. Taking them literally halves the grid and leaves the tiles that
+    // fall outside it unread.
+    let rows = src.read_u8().map_err(|e| at!(Error::from(e)))?.saturating_add(1);
+    let columns = src.read_u8().map_err(|e| at!(Error::from(e)))?.saturating_add(1);
+
+    // Bit 0 of flags picks the field width: clear for 16-bit, set for 32-bit.
     let (output_width, output_height) = if flags_byte & 1 == 0 {
-        // 16-bit fields
         (u32::from(be_u16(src)?), u32::from(be_u16(src)?))
     } else {
-        // 32-bit fields
         (be_u32(src)?, be_u32(src)?)
     };
 
