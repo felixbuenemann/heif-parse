@@ -4736,7 +4736,13 @@ fn read_iprp<T: Read>(src: &mut BMFFBox<'_, T>, options: &ParseOptions) -> Resul
                 properties = read_ipco(&mut b, options)?;
             },
             BoxType::ItemPropertyAssociationBox => {
-                associations = read_ipma(&mut b)?;
+                // ISO 14496-12 § 8.11.14 permits more than one ipma in an
+                // iprp, and real files use it. Assigning rather than
+                // appending kept only the last, so every item described by an
+                // earlier one came back with no properties at all — not a
+                // wrong size or colour, but none.
+                let mut more = read_ipma(&mut b)?;
+                associations.append(&mut more).map_err(|e| at!(Error::from(e)))?;
             },
             _ => return Err(at!(Error::InvalidData("unexpected ipco child"))),
         }
