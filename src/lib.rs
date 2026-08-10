@@ -1249,10 +1249,24 @@ struct TrackReference {
 }
 
 /// Codec properties extracted from a `stsd` VisualSampleEntry.
-#[derive(Debug, Clone, Default)]
+///
+/// Carries whichever codec configuration the sample entry named; a track
+/// holds one codec, so at most one of the two is set.
+#[derive(Debug, Default)]
 struct TrackCodecConfig {
     av1_config: Option<AV1Config>,
+    hevc_config: Option<HEVCConfig>,
     color_info: Option<ColorInformation>,
+}
+
+impl TryClone for TrackCodecConfig {
+    fn try_clone(&self) -> Result<Self, TryReserveError> {
+        Ok(Self {
+            av1_config: self.av1_config.clone(),
+            hevc_config: self.hevc_config.as_ref().map(TryClone::try_clone).transpose()?,
+            color_info: self.color_info.clone(),
+        })
+    }
 }
 
 /// Parsed data from a single track box (`trak`).
@@ -1865,7 +1879,9 @@ impl<'data> AvifParser<'data> {
         // Use codec config from the color track's stsd if available.
         let Some(meta) = parsed.meta else {
             let track_config = animation_data.as_ref()
-                .map(|a| a.codec_config.clone())
+                .map(|a| a.codec_config.try_clone())
+                .transpose()
+                .map_err(|e| at!(Error::from(e)))?
                 .unwrap_or_default();
             return Ok(Self {
                 raw,
@@ -1879,9 +1895,7 @@ impl<'data> AvifParser<'data> {
                 premultiplied_alpha: false,
                 spatial_extents: None,
                 av1_config: track_config.av1_config,
-                // Sample entries do not carry hvcC yet, so a track-only file
-                // has no HEVC configuration to report.
-                hevc_config: None,
+                hevc_config: track_config.hevc_config,
                 color_info: track_config.color_info,
                 rotation: None,
                 mirror: None,
@@ -2182,14 +2196,17 @@ impl<'data> AvifParser<'data> {
         let av1_config = find_prop!(AV1Config)
             .or_else(|| track_config.and_then(|c| c.av1_config.clone()));
         // HEVCConfig owns its parameter sets, so it try_clones rather than
-        // clones and cannot ride the macro above.
+        // clones and cannot ride the macro above. The track's sample entry is
+        // the same fallback av1_config uses.
         let hevc_config = meta
             .properties
             .iter()
             .find_map(|p| match (&p.property, p.item_id == meta.primary_item_id) {
-                (ItemProperty::HEVCConfig(c), true) => Some(c.try_clone()),
+                (ItemProperty::HEVCConfig(c), true) => Some(c),
                 _ => None,
             })
+            .or_else(|| track_config.and_then(|c| c.hevc_config.as_ref()))
+            .map(TryClone::try_clone)
             .transpose()
             .map_err(|e| at!(Error::from(e)))?;
         let color_info = find_prop!(ColorInformation)
@@ -5609,8 +5626,13 @@ fn read_stsd<T: Read>(src: &mut BMFFBox<'_, T>) -> Result<TrackCodecConfig> {
             break;
         };
 
-        // Check if this is an av01 VisualSampleEntry
-        if entry_box.head.name != BoxType::AV1SampleEntry {
+        // Only visual sample entries this parser can read a codec config out
+        // of. hev1 differs from hvc1 by allowing parameter sets in-band as
+        // well as in hvcC; the record is read the same way either way.
+        if !matches!(
+            entry_box.head.name,
+            BoxType::AV1SampleEntry | BoxType::HEVCSampleEntry | BoxType::HEVCSampleEntryInBand
+        ) {
             skip_box_remain(&mut entry_box)?;
             continue;
         }
@@ -5633,6 +5655,9 @@ fn read_stsd<T: Read>(src: &mut BMFFBox<'_, T>) -> Result<TrackCodecConfig> {
                 BoxType::AV1CodecConfigurationBox => {
                     config.av1_config = Some(read_av1c(&mut sub_box)?);
                 }
+                BoxType::HEVCCodecConfigurationBox => {
+                    config.hevc_config = Some(read_hvcc(&mut sub_box)?);
+                }
                 BoxType::ColorInformationBox => {
                     if let Ok(colr) = read_colr(&mut sub_box) {
                         config.color_info = Some(colr);
@@ -5646,8 +5671,8 @@ fn read_stsd<T: Read>(src: &mut BMFFBox<'_, T>) -> Result<TrackCodecConfig> {
             }
         }
 
-        // Only need the first av01 entry
-        if config.av1_config.is_some() {
+        // Only need the first entry that yielded a codec config
+        if config.av1_config.is_some() || config.hevc_config.is_some() {
             break;
         }
     }
