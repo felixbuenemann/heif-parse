@@ -1710,6 +1710,7 @@ pub struct AvifParser<'data> {
     thumbnails: TryVec<(ThumbnailInfo, ItemExtents)>,
     animation_data: Option<AnimationParserData>,
     premultiplied_alpha: bool,
+    primary_item_id: u32,
     spatial_extents: Option<ImageSpatialExtents>,
     av1_config: Option<AV1Config>,
     hevc_config: Option<HEVCConfig>,
@@ -1988,6 +1989,8 @@ impl<'data> AvifParser<'data> {
                 thumbnails: TryVec::new(),
                 animation_data,
                 premultiplied_alpha: false,
+                // A file that is only a track has no items to number.
+                primary_item_id: 0,
                 spatial_extents: None,
                 av1_config: track_config.av1_config,
                 hevc_config: track_config.hevc_config,
@@ -2508,6 +2511,7 @@ impl<'data> AvifParser<'data> {
             thumbnails,
             animation_data,
             premultiplied_alpha,
+            primary_item_id: meta.primary_item_id,
             spatial_extents,
             av1_config,
             hevc_config,
@@ -3007,6 +3011,18 @@ impl<'data> AvifParser<'data> {
     /// Check if alpha channel uses premultiplied alpha.
     pub fn premultiplied_alpha(&self) -> bool {
         self.premultiplied_alpha
+    }
+
+    /// The item id of the primary image, as the container numbers its items.
+    ///
+    /// A file holds many items — grid tiles, thumbnails, auxiliaries — and
+    /// every accessor here that says "primary" means this one. A caller
+    /// holding an item id from elsewhere has no other way to tell whether it
+    /// names the same picture, and the answer decides whether
+    /// [`Self::primary_data`] is the right thing to decode for it.
+    #[must_use]
+    pub fn primary_item_id(&self) -> u32 {
+        self.primary_item_id
     }
 
     /// Get the primary item's dimensions from its `ispe` property, if present.

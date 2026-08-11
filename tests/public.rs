@@ -220,6 +220,35 @@ fn parser_from_bytes_primary() {
     assert!(parser.animation_info().is_none());
 }
 
+/// The primary item's id, which a grid file makes worth asking for.
+///
+/// A grid's own item is one of many — the tiles are items too — so a caller
+/// holding an id from elsewhere cannot tell whether it names the picture the
+/// `primary_*` accessors read without being told which id that is. The
+/// interesting failure is a placeholder rather than a wrong number: a stored
+/// zero reads as an item id and compares unequal to every real one.
+#[test]
+fn parser_reports_the_primary_item_id() {
+    let bytes = std::fs::read(IMAGE_GRID_5X4).expect("read file");
+    let parser = zenavif_parse::AvifParser::from_bytes(&bytes).expect("from_bytes failed");
+
+    let primary = parser.primary_item_id();
+    assert_ne!(primary, 0, "item ids start at 1, so zero means nothing was stored");
+
+    // The tiles are separate items and none of them is the primary.
+    let tiles = parser.grid_config().expect("grid config").rows as usize
+        * parser.grid_config().expect("grid config").columns as usize;
+    assert_eq!(tiles, 20);
+    for index in 0..tiles {
+        assert!(parser.tile_data(index).is_ok(), "tile {index} should resolve");
+    }
+
+    // And a file with one item reports that item.
+    let bytes = std::fs::read(IMAGE_AVIF).expect("read file");
+    let parser = zenavif_parse::AvifParser::from_bytes(&bytes).expect("from_bytes failed");
+    assert_ne!(parser.primary_item_id(), 0);
+}
+
 #[test]
 fn parser_from_bytes_multi_extent() {
     let bytes = std::fs::read(IMAGE_AVIF_EXTENTS).expect("read file");
