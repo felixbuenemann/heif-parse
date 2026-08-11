@@ -1298,6 +1298,10 @@ struct TrackCodecConfig {
     av1_config: Option<AV1Config>,
     hevc_config: Option<HEVCConfig>,
     color_info: Option<ColorInformation>,
+    /// A second `colr` holding an ICC profile, when the entry states both.
+    icc_color_info: Option<ColorInformation>,
+    content_light_level: Option<ContentLightLevel>,
+    mastering_display: Option<MasteringDisplayColourVolume>,
     /// The VisualSampleEntry's declared frame size.
     ///
     /// A track states its geometry here rather than in an `ispe`, which is an
@@ -1312,6 +1316,9 @@ impl TryClone for TrackCodecConfig {
             av1_config: self.av1_config.clone(),
             hevc_config: self.hevc_config.as_ref().map(TryClone::try_clone).transpose()?,
             color_info: self.color_info.clone(),
+            icc_color_info: self.icc_color_info.clone(),
+            content_light_level: self.content_light_level,
+            mastering_display: self.mastering_display,
             spatial_extents: self.spatial_extents,
         })
     }
@@ -2914,6 +2921,31 @@ impl<'data> AvifParser<'data> {
         self.animation_data
             .as_ref()
             .and_then(|a| a.codec_config.color_info.as_ref())
+    }
+
+    /// The track's ICC profile, when its sample entry carries one beside the
+    /// code points.
+    #[must_use]
+    pub fn track_icc_color_info(&self) -> Option<&ColorInformation> {
+        self.animation_data
+            .as_ref()
+            .and_then(|a| a.codec_config.icc_color_info.as_ref())
+    }
+
+    /// The track's `clli`, stating the luminance its samples were graded for.
+    #[must_use]
+    pub fn track_content_light_level(&self) -> Option<&ContentLightLevel> {
+        self.animation_data
+            .as_ref()
+            .and_then(|a| a.codec_config.content_light_level.as_ref())
+    }
+
+    /// The track's `mdcv`, describing the display it was graded on.
+    #[must_use]
+    pub fn track_mastering_display(&self) -> Option<&MasteringDisplayColourVolume> {
+        self.animation_data
+            .as_ref()
+            .and_then(|a| a.codec_config.mastering_display.as_ref())
     }
 
     pub fn av1_config(&self) -> Option<&AV1Config> {
@@ -5964,8 +5996,32 @@ fn read_stsd<T: Read>(src: &mut BMFFBox<'_, T>) -> Result<TrackCodecConfig> {
                     config.hevc_config = Some(read_hvcc(&mut sub_box)?);
                 }
                 BoxType::ColorInformationBox => {
-                    if let Ok(colr) = read_colr(&mut sub_box) {
-                        config.color_info = Some(colr);
+                    // An entry may hold two: code points and a profile. They
+                    // are not alternatives, so neither displaces the other.
+                    match read_colr(&mut sub_box) {
+                        Ok(colr @ ColorInformation::IccProfile(_)) => {
+                            if config.icc_color_info.is_none() {
+                                config.icc_color_info = Some(colr);
+                            }
+                        }
+                        Ok(colr) => {
+                            if config.color_info.is_none() {
+                                config.color_info = Some(colr);
+                            }
+                        }
+                        Err(_) => skip_box_remain(&mut sub_box)?,
+                    }
+                }
+                BoxType::ContentLightLevelBox => {
+                    if let Ok(clli) = read_clli(&mut sub_box) {
+                        config.content_light_level = Some(clli);
+                    } else {
+                        skip_box_remain(&mut sub_box)?;
+                    }
+                }
+                BoxType::MasteringDisplayColourVolumeBox => {
+                    if let Ok(mdcv) = read_mdcv(&mut sub_box) {
+                        config.mastering_display = Some(mdcv);
                     } else {
                         skip_box_remain(&mut sub_box)?;
                     }
