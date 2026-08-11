@@ -1835,18 +1835,39 @@ fn parser_no_gain_map_on_normal_image() {
     assert!(parser.gain_map_color_info().is_none());
 }
 
+/// A gain map this reader cannot make sense of is ABSENT, not fatal.
+///
+/// These two files carry a `tmap` declaring a version newer than the one
+/// implemented, and used to fail the whole parse. That is the wrong trade: a
+/// gain map is an enhancement, and refusing the container denies the caller
+/// the base image as well — which is a perfectly good picture that has
+/// nothing wrong with it.
+///
+/// The same rule the rest of this crate now follows for a tone map it cannot
+/// read, wherever the reason: an unknown version, a payload it cannot parse,
+/// a construction it does not resolve.
 #[test]
-fn parser_gain_map_unsupported_version() {
+fn parser_gain_map_unsupported_version_is_absent_not_fatal() {
     let bytes = std::fs::read("tests/gainmap/unsupported_gainmap_version.avif").expect("read file");
-    let result = heif_parse::AvifParser::from_bytes(&bytes);
-    assert!(result.is_err(), "unsupported tmap version should fail");
+    let parser =
+        heif_parse::AvifParser::from_bytes(&bytes).expect("the base image is still readable");
+    assert!(
+        parser.gain_map_metadata().is_none(),
+        "a tmap version this reader does not implement should read as no gain map"
+    );
+    assert!(parser.gain_map_data().is_none());
 }
 
 #[test]
-fn parser_gain_map_unsupported_minimum_version() {
+fn parser_gain_map_unsupported_minimum_version_is_absent_not_fatal() {
     let bytes = std::fs::read("tests/gainmap/unsupported_gainmap_minimum_version.avif").expect("read file");
-    let result = heif_parse::AvifParser::from_bytes(&bytes);
-    assert!(result.is_err(), "unsupported tmap minimum version should fail");
+    let parser =
+        heif_parse::AvifParser::from_bytes(&bytes).expect("the base image is still readable");
+    assert!(
+        parser.gain_map_metadata().is_none(),
+        "a tmap minimum version above this reader's should read as no gain map"
+    );
+    assert!(parser.gain_map_data().is_none());
 }
 
 #[cfg(feature = "eager")]

@@ -1947,6 +1947,8 @@ pub struct AvifParser<'data> {
     xmp_item: Option<ItemExtents>,
     gain_map_metadata: Option<GainMapMetadata>,
     gain_map: Option<ItemExtents>,
+    apple_gain_map: Option<ItemExtents>,
+    apple_gain_map_hevc_config: Option<HEVCConfig>,
     gain_map_color_info: Option<ColorInformation>,
     depth_item: Option<ItemExtents>,
     depth_width: u32,
@@ -2236,6 +2238,8 @@ impl<'data> AvifParser<'data> {
                 xmp_item: None,
                 gain_map_metadata: None,
                 gain_map: None,
+                apple_gain_map: None,
+                apple_gain_map_hevc_config: None,
                 gain_map_color_info: None,
                 depth_item: None,
                 depth_width: 0,
@@ -2296,6 +2300,38 @@ impl<'data> AvifParser<'data> {
                     && iref.item_type == b"prem"
             })
         });
+
+        // Apple's gain map, which is an auxiliary like the two beside it.
+        let apple_gain_map_item_id = meta
+            .item_references
+            .iter()
+            .filter(|iref| {
+                iref.to_item_id == meta.primary_item_id
+                    && iref.from_item_id != meta.primary_item_id
+                    && iref.item_type == b"auxl"
+            })
+            .map(|iref| iref.from_item_id)
+            .find(|&item_id| {
+                meta.properties.iter().any(|prop| {
+                    prop.item_id == item_id
+                        && match &prop.property {
+                            ItemProperty::AuxiliaryType(urn) => {
+                                is_apple_gain_map_urn(urn.type_subtype().0)
+                            }
+                            _ => false,
+                        }
+                })
+            });
+        let apple_gain_map = apple_gain_map_item_id
+            .map(|id| Self::get_item_extents(&meta, id))
+            .transpose()?;
+        // Its own record, for the same reason the alpha auxiliary needs one:
+        // a separately coded picture whose parameter sets describe itself.
+        let apple_gain_map_hevc_config = apple_gain_map_item_id
+            .and_then(|id| hevc_config_for(&meta.properties, id))
+            .map(TryClone::try_clone)
+            .transpose()
+            .map_err(|e| at!(Error::from(e)))?;
 
         // Find depth auxiliary item (auxl reference with depth auxC type)
         let depth_item_id = meta
@@ -2526,7 +2562,11 @@ impl<'data> AvifParser<'data> {
         };
 
         // Detect gain map (tmap derived image item)
-        let (gain_map_metadata, gain_map, gain_map_color_info) = {
+        // Labelled so that anything unreadable inside can yield "no gain
+        // map" instead of failing the container. A gain map is an
+        // enhancement, and a reader that cannot make sense of one owes the
+        // caller the base image, not a refusal.
+        let (gain_map_metadata, gain_map, gain_map_color_info) = 'gain_map: {
             let tmap_item = meta.item_infos.iter()
                 .find(|info| info.item_type == b"tmap");
 
@@ -2547,12 +2587,34 @@ impl<'data> AvifParser<'data> {
                     let gmap_item_id = inputs[1].0;
 
                     if base_item_id == meta.primary_item_id {
-                        // Read tmap item's data payload (ToneMapImage)
+                        // Read tmap item's data payload (ToneMapImage).
+                        //
+                        // From `idat` as readily as from `mdat`. A derived
+                        // item's payload is small and writers put it either
+                        // place -- the grid reader has said so since grids
+                        // were first read, and the tmap reader demanded the
+                        // file construction and ERRORED otherwise, which took
+                        // the whole container down over one item's storage.
+                        // Files written by the macOS 26 SDK do exactly this
+                        // and would not parse at all.
+                        //
+                        // And absence rather than failure throughout. A gain
+                        // map is an enhancement: a reader that cannot make
+                        // sense of one should hand back the base image, not
+                        // refuse the file.
                         let tmap_extents = Self::get_item_extents(&meta, tmap_id)?;
-                        let tmap_data = Self::resolve_extents_from_raw(
-                            raw.as_ref(), &parsed.mdat_bounds, &tmap_extents,
-                        )?;
-                        let metadata = parse_tone_map_image(&tmap_data)?;
+                        let tmap_data = Self::resolve_derived_payload(
+                            raw.as_ref(),
+                            &parsed.mdat_bounds,
+                            meta.idat.as_ref(),
+                            &tmap_extents,
+                        );
+                        let Some(tmap_data) = tmap_data else {
+                            break 'gain_map (None, None, None);
+                        };
+                        let Ok(metadata) = parse_tone_map_image(&tmap_data) else {
+                            break 'gain_map (None, None, None);
+                        };
 
                         // Get gain map image extents
                         let gmap_extents = Self::get_item_extents(&meta, gmap_item_id)?;
@@ -2797,6 +2859,8 @@ impl<'data> AvifParser<'data> {
             xmp_item,
             gain_map_metadata,
             gain_map,
+            apple_gain_map,
+            apple_gain_map_hevc_config,
             gain_map_color_info,
             depth_item,
             depth_width,
@@ -2828,6 +2892,39 @@ impl<'data> AvifParser<'data> {
             construction_method: item.construction_method,
             extents,
         })
+    }
+
+    /// A derived item's payload, from wherever the writer put it.
+    ///
+    /// `grid` and `tmap` bodies are a few dozen bytes and are written into
+    /// `idat` about as often as into `mdat` -- libheif does the former for
+    /// grids, the macOS 26 SDK for tone maps. Reading only one construction
+    /// means refusing perfectly ordinary files.
+    ///
+    /// `None` for anything unreadable, because every caller wants to carry on
+    /// without the derivation rather than fail the container.
+    fn resolve_derived_payload(
+        raw: &[u8],
+        mdat_bounds: &[MdatBounds],
+        idat: Option<&TryVec<u8>>,
+        item: &ItemExtents,
+    ) -> Option<std::vec::Vec<u8>> {
+        match item.construction_method {
+            ConstructionMethod::Idat => {
+                let idat = idat?;
+                let extent = item.extents.first()?;
+                let start = usize::try_from(extent.start()).ok()?;
+                let slice = match extent {
+                    ExtentRange::WithLength(range) => {
+                        let len = usize::try_from(range.end.checked_sub(range.start)?).ok()?;
+                        idat.get(start..start.checked_add(len)?)
+                    }
+                    ExtentRange::ToEnd(_) => idat.get(start..),
+                }?;
+                Some(slice.to_vec())
+            }
+            _ => Self::resolve_extents_from_raw(raw, mdat_bounds, item).ok(),
+        }
     }
 
     /// Resolve file-based item extents from a raw buffer during `build()`,
@@ -3391,6 +3488,34 @@ impl<'data> AvifParser<'data> {
     #[must_use]
     pub fn compressed_extents(&self) -> Option<&ItemCompressedExtents> {
         self.compressed_extents.as_ref()
+    }
+
+    /// Apple's HDR gain map image, if the file carries one.
+    ///
+    /// A different mechanism from [`Self::gain_map_data`], not a different
+    /// spelling of it. ISO 21496-1 derives a `tmap` item and puts the
+    /// parameters in its body; Apple references an ordinary auxiliary image
+    /// through `auxl` and puts the parameters in XMP. A file carries one or
+    /// the other, and a reader that knows only the first reports every
+    /// iPhone photograph as having no gain map.
+    ///
+    /// This is the coded image alone. Its parameters are in the XMP
+    /// [`Self::xmp_data`] returns.
+    pub fn apple_gain_map_data(&self) -> Option<Result<Cow<'_, [u8]>>> {
+        self.apple_gain_map
+            .as_ref()
+            .map(|item| self.resolve_item(item))
+    }
+
+    /// HEVC configuration for Apple's gain map image, if it has its own.
+    ///
+    /// Needed for the same reason [`Self::alpha_hevc_config`] is: the
+    /// auxiliary is a separately coded picture, usually monochrome where the
+    /// image beside it is not, and decoding it against the primary's record
+    /// returns a frame that is wrong rather than one that fails.
+    #[must_use]
+    pub fn apple_gain_map_hevc_config(&self) -> Option<&HEVCConfig> {
+        self.apple_gain_map_hevc_config.as_ref()
     }
 
     /// The HEVC configuration from the track's sample entry, if there is one.
@@ -6046,6 +6171,21 @@ fn read_auxc<T: Read>(src: &mut BMFFBox<'_, T>, options: &ParseOptions) -> Resul
 fn is_depth_auxiliary_urn(urn: &[u8]) -> bool {
     urn == b"urn:mpeg:mpegB:cicp:systems:auxiliary:depth"
         || urn == b"urn:mpeg:hevc:2015:auxid:2"
+}
+
+/// Does this `auxC` URN name Apple's HDR gain map?
+///
+/// Apple carries a gain map as an ordinary AUXILIARY IMAGE — the same shape
+/// as an alpha plane — where ISO 21496-1 uses a derived `tmap` item with a
+/// binary parameter block. The two are unrelated mechanisms for the same
+/// idea, and a reader that knows only `tmap` reports every iPhone photograph
+/// as having no gain map at all.
+///
+/// The parameters live in XMP (`HDRGainMap:HDRGainMapVersion` and the
+/// headroom), not on the item, so finding the image is only half of reading
+/// one.
+fn is_apple_gain_map_urn(urn: &[u8]) -> bool {
+    urn == b"urn:com:apple:photo:2020:aux:hdrgainmap"
 }
 
 /// Does this `auxC` URN name an alpha plane?
