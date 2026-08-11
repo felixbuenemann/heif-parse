@@ -597,6 +597,23 @@ pub struct ImageRotation {
     pub angle: u16,
 }
 
+/// One transformative property, in the order it must be applied.
+///
+/// A `dimg` chain of `iden` items may carry `clap`, `irot` and `imir` at every
+/// link, and every one of them applies. This is one such property, taken from
+/// one item in the chain; see [`AvifParser::derivation_transforms`] for the
+/// sequence and the order it is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DerivedTransform {
+    /// A clean aperture, to be resolved against the dimensions the preceding
+    /// transforms produced rather than against the coded ones.
+    CleanAperture(CleanAperture),
+    /// A rotation, counter-clockwise, as `irot` states it.
+    Rotation(ImageRotation),
+    /// A mirror.
+    Mirror(ImageMirror),
+}
+
 /// Image mirror from the `imir` property box.
 ///
 /// Specifies a mirror (flip) axis to apply after rotation.
@@ -1711,6 +1728,7 @@ pub struct AvifParser<'data> {
     animation_data: Option<AnimationParserData>,
     premultiplied_alpha: bool,
     primary_item_id: u32,
+    derivation_transforms: TryVec<DerivedTransform>,
     spatial_extents: Option<ImageSpatialExtents>,
     av1_config: Option<AV1Config>,
     hevc_config: Option<HEVCConfig>,
@@ -1991,6 +2009,7 @@ impl<'data> AvifParser<'data> {
                 premultiplied_alpha: false,
                 // A file that is only a track has no items to number.
                 primary_item_id: 0,
+                derivation_transforms: TryVec::new(),
                 spatial_extents: None,
                 av1_config: track_config.av1_config,
                 hevc_config: track_config.hevc_config,
@@ -2029,57 +2048,18 @@ impl<'data> AvifParser<'data> {
         };
 
         // Get primary item extents
-        let is_iden = meta
-            .item_infos
-            .iter()
-            .find(|x| x.item_id == meta.primary_item_id)
-            .is_some_and(|info| info.item_type == b"iden");
         // An `iden` presents another item under its own properties: an
         // identity derivation, used to apply a rotation or a crop without
         // recoding the picture. Its geometry and transforms are its own and
         // are read from it as for any item; its coded data and codec
         // configuration belong to the item it points at through `dimg`, and
         // it has none of either itself.
-        let coded_item_id = if is_iden {
-            // The derivation can be a chain -- one `iden` deriving from
-            // another, which is how a file states a crop and a rotation as
-            // separate steps -- so this walks it rather than taking one hop.
-            // Bounded, and refusing to revisit an item, because a file is
-            // free to describe a cycle and a reader is not free to follow it.
-            const MAX_DERIVATION_DEPTH: usize = 8;
-            let mut current = meta.primary_item_id;
-            let mut seen = TryVec::new();
-            seen.push(current).map_err(|e| at!(Error::from(e)))?;
-            loop {
-                let next = meta
-                    .item_references
-                    .iter()
-                    .find(|reference| {
-                        reference.item_type == b"dimg" && reference.from_item_id == current
-                    })
-                    .map(|reference| reference.to_item_id)
-                    .ok_or_else(|| at!(Error::InvalidData("iden item references no image")))?;
-                if seen.contains(&next) {
-                    return Err(at!(Error::InvalidData("derivation references itself")));
-                }
-                current = next;
-                seen.push(current).map_err(|e| at!(Error::from(e)))?;
-                let derived = meta
-                    .item_infos
-                    .iter()
-                    .find(|info| info.item_id == current)
-                    .is_some_and(|info| info.item_type == b"iden");
-                if !derived {
-                    break;
-                }
-                if seen.len() > MAX_DERIVATION_DEPTH {
-                    return Err(at!(Error::InvalidData("derivation chain too long")));
-                }
-            }
-            current
-        } else {
-            meta.primary_item_id
-        };
+        let derivation = derivation_chain(&meta, meta.primary_item_id)?;
+        let coded_item_id = derivation[derivation.len() - 1];
+        // Every link's transformative properties, in the order a decoder
+        // applies them. The single-property accessors below report the primary
+        // item's only, which is the whole chain exactly when it is one link.
+        let derivation_transforms = derivation_transforms_of(&meta, meta.primary_item_id)?;
         let primary = Self::get_item_extents(&meta, coded_item_id)?;
 
         // Find alpha item and get its extents
@@ -2512,6 +2492,7 @@ impl<'data> AvifParser<'data> {
             animation_data,
             premultiplied_alpha,
             primary_item_id: meta.primary_item_id,
+            derivation_transforms,
             spatial_extents,
             av1_config,
             hevc_config,
@@ -3011,6 +2992,24 @@ impl<'data> AvifParser<'data> {
     /// Check if alpha channel uses premultiplied alpha.
     pub fn premultiplied_alpha(&self) -> bool {
         self.premultiplied_alpha
+    }
+
+    /// Every transformative property along the derivation chain, in the order
+    /// a decoder applies them: CODED ITEM FIRST, then each item deriving from
+    /// it, ending at the primary.
+    ///
+    /// A `dimg` chain of `iden` items may carry `clap`, `irot` and `imir` at
+    /// every link, and all of them apply. [`Self::rotation`],
+    /// [`Self::mirror`] and [`Self::clean_aperture`] report the PRIMARY item's
+    /// only, which is the whole story exactly when the chain is one link long
+    /// — the common case, and the reason the shortfall is easy to miss.
+    ///
+    /// Each `clap` here is unresolved: resolve it against the dimensions the
+    /// preceding entries produce, not against the coded ones, since a crop
+    /// after a quarter-turn measures along swapped axes.
+    #[must_use]
+    pub fn derivation_transforms(&self) -> &[DerivedTransform] {
+        &self.derivation_transforms
     }
 
     /// The item id of the primary image, as the container numbers its items.
@@ -5268,6 +5267,85 @@ pub(crate) struct AssociatedProperty {
     pub property: ItemProperty,
 }
 
+/// The derivation chain from an item down to the coded image it presents.
+///
+/// An `iden` presents another item under its own properties, and that item may
+/// itself be an `iden`, which is how a file states a crop and a rotation as
+/// separate steps. The returned chain starts at `from` and ends at the coded
+/// item; for an item that is not an `iden` it is just `[from]`.
+///
+/// Bounded, and refusing to revisit an item, because a file is free to
+/// describe a cycle and a reader is not free to follow it.
+fn derivation_chain(meta: &AvifInternalMeta, from: u32) -> Result<TryVec<u32>> {
+    /// Enough for any sane file. A chain this long is a malformed or hostile
+    /// one, not a picture with many steps.
+    const MAX_DERIVATION_DEPTH: usize = 8;
+
+    let is_iden = |item_id: u32| {
+        meta.item_infos
+            .iter()
+            .find(|info| info.item_id == item_id)
+            .is_some_and(|info| info.item_type == b"iden")
+    };
+
+    let mut chain = TryVec::new();
+    chain.push(from).map_err(|e| at!(Error::from(e)))?;
+    let mut current = from;
+    while is_iden(current) {
+        let next = meta
+            .item_references
+            .iter()
+            .find(|reference| reference.item_type == b"dimg" && reference.from_item_id == current)
+            .map(|reference| reference.to_item_id)
+            .ok_or_else(|| at!(Error::InvalidData("iden item references no image")))?;
+        if chain.contains(&next) {
+            return Err(at!(Error::InvalidData("derivation references itself")));
+        }
+        chain.push(next).map_err(|e| at!(Error::from(e)))?;
+        if chain.len() > MAX_DERIVATION_DEPTH {
+            return Err(at!(Error::InvalidData("derivation chain too long")));
+        }
+        current = next;
+    }
+    Ok(chain)
+}
+
+/// Every transformative property along a derivation chain, in the order a
+/// decoder applies them: CODED ITEM FIRST, then each item that derives from
+/// it, ending at `from`.
+///
+/// That order is what the recursion produces rather than what the chain reads
+/// like. A decoder handed the outermost item decodes its child first, applies
+/// the child's properties, and only then applies its own — so the properties
+/// nearest the coded image run first. Reversing this is not a visible mistake
+/// on a file whose links are symmetric.
+///
+/// Within one item the properties keep their association order, which is the
+/// order the file's `ipma` lists them.
+fn derivation_transforms_of(meta: &AvifInternalMeta, from: u32) -> Result<TryVec<DerivedTransform>> {
+    let chain = derivation_chain(meta, from)?;
+    let mut transforms = TryVec::new();
+    // `TryVec`'s iterator is not double-ended, so this indexes rather than
+    // reversing. The chain reads outermost-first; applying it runs the other
+    // way.
+    for position in (0..chain.len()).rev() {
+        let item_id = chain[position];
+        for association in &meta.properties {
+            if association.item_id != item_id {
+                continue;
+            }
+            let transform = match &association.property {
+                ItemProperty::CleanAperture(aperture) => DerivedTransform::CleanAperture(*aperture),
+                ItemProperty::Rotation(rotation) => DerivedTransform::Rotation(*rotation),
+                ItemProperty::Mirror(mirror) => DerivedTransform::Mirror(*mirror),
+                _ => continue,
+            };
+            transforms.push(transform).map_err(|e| at!(Error::from(e)))?;
+        }
+    }
+    Ok(transforms)
+}
+
 /// The `hvcC` associated with one item, if the file gives that item one.
 ///
 /// Selection is by item id and nothing else. Items in a HEIF each carry their
@@ -7494,6 +7572,145 @@ mod sample_offset_overflow_tests {
             Err(Error::InvalidData(msg)) => assert_eq!(msg, "sample offset overflow"),
             other => panic!("expected InvalidData(sample offset overflow), got {:?}", other),
         }
+    }
+
+    /// Every link of a derivation chain contributes its transforms, coded
+    /// item first.
+    ///
+    /// The order is the whole risk here. A decoder handed the outermost item
+    /// decodes its child first, applies the CHILD's properties, and only then
+    /// applies its own — so the properties nearest the coded image run first,
+    /// which is the reverse of how the chain reads. Getting it backwards is
+    /// invisible on a symmetric file: the one such file in any corpus to hand,
+    /// C039.heic of the Nokia HEIC conformance set, crops two centred squares
+    /// and rotates by the same angle twice, so both orders agree on it.
+    ///
+    /// So this file is deliberately ASYMMETRIC — a different aperture and a
+    /// different operation on each link — and reversing the chain, or dropping
+    /// either end of it, changes the expected sequence.
+    #[test]
+    fn derivation_transforms_run_from_the_coded_item_outwards() {
+        fn aperture(width: u32) -> CleanAperture {
+            CleanAperture {
+                width_n: width,
+                width_d: 1,
+                height_n: width,
+                height_d: 1,
+                horiz_off_n: 0,
+                horiz_off_d: 1,
+                vert_off_n: 0,
+                vert_off_d: 1,
+            }
+        }
+        fn entry(item_id: u32, item_type: &[u8; 4]) -> ItemInfoEntry {
+            ItemInfoEntry { item_id, item_type: FourCC::from(*item_type) }
+        }
+        fn derives(from_item_id: u32, to_item_id: u32) -> SingleItemTypeReferenceBox {
+            SingleItemTypeReferenceBox {
+                item_type: FourCC::from(*b"dimg"),
+                from_item_id,
+                to_item_id,
+                reference_index: 0,
+            }
+        }
+        fn associate(item_id: u32, property: ItemProperty) -> AssociatedProperty {
+            AssociatedProperty { item_id, property }
+        }
+
+        // 3 (iden) --dimg--> 2 (iden) --dimg--> 1 (coded)
+        let mut item_infos = TryVec::new();
+        item_infos.push(entry(1, b"av01")).unwrap();
+        item_infos.push(entry(2, b"iden")).unwrap();
+        item_infos.push(entry(3, b"iden")).unwrap();
+
+        let mut item_references = TryVec::new();
+        item_references.push(derives(3, 2)).unwrap();
+        item_references.push(derives(2, 1)).unwrap();
+
+        // Listed OUTERMOST first, so a helper that simply walked the list
+        // would produce the reverse of the right answer. The coded item
+        // carries one too, which a chain that starts at the first `iden`
+        // would drop.
+        let mut properties = TryVec::new();
+        properties
+            .push(associate(3, ItemProperty::Rotation(ImageRotation { angle: 180 })))
+            .unwrap();
+        properties
+            .push(associate(2, ItemProperty::CleanAperture(aperture(300))))
+            .unwrap();
+        properties
+            .push(associate(2, ItemProperty::Mirror(ImageMirror { axis: 1 })))
+            .unwrap();
+        properties
+            .push(associate(1, ItemProperty::CleanAperture(aperture(600))))
+            .unwrap();
+
+        let meta = AvifInternalMeta {
+            item_references,
+            properties,
+            primary_item_id: 3,
+            iloc_items: TryVec::new(),
+            item_infos,
+            idat: None,
+            entity_groups: TryVec::new(),
+        };
+
+        let chain = derivation_chain(&meta, 3).unwrap();
+        assert_eq!(chain.as_slice(), &[3, 2, 1], "the chain reads outermost first");
+
+        let transforms = derivation_transforms_of(&meta, 3).unwrap();
+        assert_eq!(
+            transforms.as_slice(),
+            &[
+                // The coded item's own, which is easy to omit entirely.
+                DerivedTransform::CleanAperture(aperture(600)),
+                // Then the inner `iden`, in association order: the aperture
+                // was listed before the mirror and stays that way.
+                DerivedTransform::CleanAperture(aperture(300)),
+                DerivedTransform::Mirror(ImageMirror { axis: 1 }),
+                // And the primary last.
+                DerivedTransform::Rotation(ImageRotation { angle: 180 }),
+            ],
+            "transforms must run coded item first, association order within each item"
+        );
+
+        // An item that derives from nothing is a chain of one, and reports
+        // only its own.
+        let plain = derivation_transforms_of(&meta, 1).unwrap();
+        assert_eq!(plain.as_slice(), &[DerivedTransform::CleanAperture(aperture(600))]);
+    }
+
+    /// A chain that refers to itself is refused rather than followed.
+    #[test]
+    fn a_derivation_cycle_is_refused() {
+        let mut item_infos = TryVec::new();
+        item_infos
+            .push(ItemInfoEntry { item_id: 1, item_type: FourCC::from(*b"iden") })
+            .unwrap();
+        item_infos
+            .push(ItemInfoEntry { item_id: 2, item_type: FourCC::from(*b"iden") })
+            .unwrap();
+        let mut item_references = TryVec::new();
+        for (from_item_id, to_item_id) in [(1u32, 2u32), (2, 1)] {
+            item_references
+                .push(SingleItemTypeReferenceBox {
+                    item_type: FourCC::from(*b"dimg"),
+                    from_item_id,
+                    to_item_id,
+                    reference_index: 0,
+                })
+                .unwrap();
+        }
+        let meta = AvifInternalMeta {
+            item_references,
+            properties: TryVec::new(),
+            primary_item_id: 1,
+            iloc_items: TryVec::new(),
+            item_infos,
+            idat: None,
+            entity_groups: TryVec::new(),
+        };
+        assert!(derivation_chain(&meta, 1).is_err());
     }
 
     /// A picture and its alpha auxiliary each get their OWN `hvcC`.
