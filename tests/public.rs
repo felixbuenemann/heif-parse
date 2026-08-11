@@ -2461,3 +2461,31 @@ fn parser_default_path_allows_within_total_megapixels_limit() {
         &bytes, &config, &zenavif_parse::Unstoppable,
     ).expect("parser should accept grid within total_megapixels_limit");
 }
+
+// -- Track geometry and colour (stsd VisualSampleEntry) --
+
+#[test]
+fn track_reports_its_own_frame_size() {
+    let bytes = std::fs::read(ANIM_8BPC).expect("read file");
+    let parser = zenavif_parse::AvifParser::from_bytes(&bytes).expect("parse failed");
+
+    let track = parser
+        .track_spatial_extents()
+        .expect("an animated file's track declares its frame size");
+    // Whatever the still item says, this is the track's own statement.
+    let item = parser.spatial_extents().expect("this file also has an item");
+    assert_eq!((track.width, track.height), (item.width, item.height));
+    assert!(track.width > 0 && track.height > 0);
+}
+
+#[test]
+fn a_still_has_no_track_geometry() {
+    let bytes = std::fs::read(IMAGE_AVIF).expect("read file");
+    let parser = zenavif_parse::AvifParser::from_bytes(&bytes).expect("parse failed");
+
+    assert!(parser.animation_info().is_none());
+    // No track, so nothing to report -- rather than the item's size restated
+    // under a name that would then mean two different things.
+    assert!(parser.track_spatial_extents().is_none());
+    assert!(parser.track_color_info().is_none());
+}

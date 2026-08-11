@@ -1298,6 +1298,12 @@ struct TrackCodecConfig {
     av1_config: Option<AV1Config>,
     hevc_config: Option<HEVCConfig>,
     color_info: Option<ColorInformation>,
+    /// The VisualSampleEntry's declared frame size.
+    ///
+    /// A track states its geometry here rather than in an `ispe`, which is an
+    /// item property. A file that is a track and nothing else has no item to
+    /// carry one, so without this there is nowhere left to ask.
+    spatial_extents: Option<ImageSpatialExtents>,
 }
 
 impl TryClone for TrackCodecConfig {
@@ -1306,6 +1312,7 @@ impl TryClone for TrackCodecConfig {
             av1_config: self.av1_config.clone(),
             hevc_config: self.hevc_config.as_ref().map(TryClone::try_clone).transpose()?,
             color_info: self.color_info.clone(),
+            spatial_extents: self.spatial_extents,
         })
     }
 }
@@ -2854,6 +2861,31 @@ impl<'data> AvifParser<'data> {
     #[must_use]
     pub fn track_hevc_config(&self) -> Option<&HEVCConfig> {
         self.animation_data.as_ref().and_then(|a| a.codec_config.hevc_config.as_ref())
+    }
+
+    /// The track's frame size, from its `stsd` VisualSampleEntry.
+    ///
+    /// The counterpart of [`Self::spatial_extents`] for timed content, and
+    /// not interchangeable with it: a file may hold a still item and a track
+    /// of different sizes, and one that holds only a track has no `ispe` at
+    /// all, so the item accessor answers `None` for a file that is perfectly
+    /// well described.
+    #[must_use]
+    pub fn track_spatial_extents(&self) -> Option<&ImageSpatialExtents> {
+        self.animation_data
+            .as_ref()
+            .and_then(|a| a.codec_config.spatial_extents.as_ref())
+    }
+
+    /// The track's colour information, from a `colr` in its sample entry.
+    ///
+    /// Read on the same terms as [`Self::track_spatial_extents`]: it belongs
+    /// to the track, and the item's [`Self::color_info`] describes the still.
+    #[must_use]
+    pub fn track_color_info(&self) -> Option<&ColorInformation> {
+        self.animation_data
+            .as_ref()
+            .and_then(|a| a.codec_config.color_info.as_ref())
     }
 
     pub fn av1_config(&self) -> Option<&AV1Config> {
@@ -5855,16 +5887,31 @@ fn read_stsd<T: Read>(src: &mut BMFFBox<'_, T>) -> Result<TrackCodecConfig> {
             continue;
         }
 
-        // Skip VisualSampleEntry fixed fields (78 bytes total):
+        // VisualSampleEntry fixed fields, 78 bytes in total:
         //   reserved[6] + data_ref_index[2] + pre_defined[2] + reserved[2] +
         //   pre_defined[12] + width[2] + height[2] + horiz_res[4] + vert_res[4] +
         //   reserved[4] + frame_count[2] + compressorname[32] + depth[2] + pre_defined[2]
+        // Width and height are read rather than skipped: they are where a
+        // track states its frame size, and a track-only file has no item
+        // property to state it instead.
         const VISUAL_SAMPLE_ENTRY_SIZE: u64 = 78;
+        const BEFORE_DIMENSIONS: u64 = 6 + 2 + 2 + 2 + 12;
+        const AFTER_DIMENSIONS: u64 = VISUAL_SAMPLE_ENTRY_SIZE - BEFORE_DIMENSIONS - 4;
         if entry_box.bytes_left() < VISUAL_SAMPLE_ENTRY_SIZE {
             skip_box_remain(&mut entry_box)?;
             continue;
         }
-        skip(&mut entry_box, VISUAL_SAMPLE_ENTRY_SIZE)?;
+        skip(&mut entry_box, BEFORE_DIMENSIONS)?;
+        let width = be_u16(&mut entry_box)?;
+        let height = be_u16(&mut entry_box)?;
+        skip(&mut entry_box, AFTER_DIMENSIONS)?;
+        // Zero means the entry declares nothing, not a zero-pixel frame.
+        if width != 0 && height != 0 {
+            config.spatial_extents = Some(ImageSpatialExtents {
+                width: u32::from(width),
+                height: u32::from(height),
+            });
+        }
 
         // Parse sub-boxes within the VisualSampleEntry for av1C and colr
         let mut sub_iter = entry_box.box_iter();
