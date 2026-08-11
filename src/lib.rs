@@ -2600,7 +2600,27 @@ impl<'data> AvifParser<'data> {
         let track_config = animation_data.as_ref().map(|a| &a.codec_config);
         let spatial_extents = find_prop!(ImageSpatialExtents);
         let av1_config = find_prop!(AV1Config)
-            .or_else(|| track_config.and_then(|c| c.av1_config.clone()));
+            .or_else(|| track_config.and_then(|c| c.av1_config.clone()))
+            // A `grid` carries no codec configuration of its own; the property
+            // sits on the tiles. The same fallback `hevc_config` makes, and
+            // for a reason that survives AV1 not needing it to DECODE: an AV1
+            // tile carries its sequence header in the stream, so a decoder
+            // manages without this, but a caller asking WHICH CODEC the item
+            // is coded in has nothing else to read. Answering "none" for
+            // every AV1 grid sends them all down whichever path handles the
+            // unknown.
+            //
+            // The tiles of a grid share one configuration, which is what
+            // makes taking the first sound.
+            .or_else(|| {
+                if !is_grid {
+                    return None;
+                }
+                meta.properties.iter().find_map(|p| match &p.property {
+                    ItemProperty::AV1Config(c) => Some(c.clone()),
+                    _ => None,
+                })
+            });
         // HEVCConfig owns its parameter sets, so it try_clones rather than
         // clones and cannot ride the macro above. The track's sample entry is
         // the same fallback av1_config uses.
