@@ -1705,6 +1705,7 @@ pub struct AvifParser<'data> {
     primary: ItemExtents,
     alpha: Option<ItemExtents>,
     grid_config: Option<GridConfig>,
+    grid_tile_extents: Option<ImageSpatialExtents>,
     tiles: TryVec<ItemExtents>,
     thumbnails: TryVec<(ThumbnailInfo, ItemExtents)>,
     animation_data: Option<AnimationParserData>,
@@ -1966,6 +1967,7 @@ impl<'data> AvifParser<'data> {
                 primary: ItemExtents { construction_method: ConstructionMethod::File, extents: TryVec::new() },
                 alpha: None,
                 grid_config: None,
+                grid_tile_extents: None,
                 tiles: TryVec::new(),
                 thumbnails: TryVec::new(),
                 animation_data,
@@ -2220,7 +2222,7 @@ impl<'data> AvifParser<'data> {
         }
 
         // Extract grid configuration and tile extents if this is a grid
-        let (grid_config, tiles) = if is_grid {
+        let (grid, tiles) = if is_grid {
             let mut tiles_with_index: TryVec<(u32, u16)> = TryVec::new();
             for iref in meta.item_references.iter() {
                 if iref.from_item_id == meta.primary_item_id && iref.item_type == b"dimg" {
@@ -2270,7 +2272,17 @@ impl<'data> AvifParser<'data> {
                 }
             }
 
-            (Some(grid_config), tile_extents)
+            // The tiles' own declared size. They share one, which is what
+            // makes taking the first sound, and it is not the output size
+            // divided by the tile count -- a grid crops its right and bottom
+            // edges, so that division names a size no tile has.
+            let tile_size = tile_ids.first().and_then(|first| {
+                meta.properties.iter().find_map(|p| match (&p.property, p.item_id == *first) {
+                    (ItemProperty::ImageSpatialExtents(e), true) => Some(*e),
+                    _ => None,
+                })
+            });
+            (Some((grid_config, tile_size)), tile_extents)
         } else {
             // Non-grid primary: enforce total_megapixels_limit on the primary
             // item's ispe dimensions if present. H1 of 2026-05-06 audit.
@@ -2288,6 +2300,10 @@ impl<'data> AvifParser<'data> {
                 tracker.validate_total_megapixels(w, h)?;
             }
             (None, TryVec::new())
+        };
+        let (grid_config, grid_tile_extents) = match grid {
+            Some((config, tile_size)) => (Some(config), tile_size),
+            None => (None, None),
         };
 
         // Detect gain map (tmap derived image item)
@@ -2464,6 +2480,7 @@ impl<'data> AvifParser<'data> {
             primary,
             alpha,
             grid_config,
+            grid_tile_extents,
             tiles,
             thumbnails,
             animation_data,
@@ -2934,6 +2951,16 @@ impl<'data> AvifParser<'data> {
     /// Get grid configuration (if grid image).
     pub fn grid_config(&self) -> Option<&GridConfig> {
         self.grid_config.as_ref()
+    }
+
+    /// The size one tile of a grid is coded at, as the tiles declare it.
+    ///
+    /// Not the output size divided by the tile count: a grid crops, so a
+    /// 3992x2992 picture in 8x6 tiles is 512x512 tiles with the right and
+    /// bottom edges trimmed, and dividing gives 499x498 — a size no tile has.
+    #[must_use]
+    pub fn grid_tile_extents(&self) -> Option<&ImageSpatialExtents> {
+        self.grid_tile_extents.as_ref()
     }
 
     /// Get number of grid tiles.
