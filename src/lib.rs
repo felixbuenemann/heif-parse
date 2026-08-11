@@ -1715,6 +1715,7 @@ pub struct AvifParser<'data> {
     hevc_config: Option<HEVCConfig>,
     color_info: Option<ColorInformation>,
     icc_color_info: Option<ColorInformation>,
+    pixel_information: Option<TryVec<u8>>,
     rotation: Option<ImageRotation>,
     mirror: Option<ImageMirror>,
     clean_aperture: Option<CleanAperture>,
@@ -1865,7 +1866,7 @@ impl<'data> AvifParser<'data> {
                     return Err(at!(Error::InvalidData("ftyp names no brand this parser reads")));
                 }
                 let major = ftyp.major_brand.value;
-                let compat = ftyp.compatible_brands.iter().map(|b| b.value).collect();
+                let compat: std::vec::Vec<[u8; 4]> = ftyp.compatible_brands.iter().map(|b| b.value).collect();
                 (major, compat)
             } else {
                 return Err(at!(Error::InvalidData("'ftyp' box must occur first")));
@@ -1884,6 +1885,20 @@ impl<'data> AvifParser<'data> {
 
             if b.head.name == BoxType::UnknownBox(u32::from_be_bytes(*b"mini")) {
                 saw_mini_box = true;
+                // The codec is named by the brand when the box does not name
+                // it itself: `avif` means AV1, `heic` means HEVC.
+                let branded = if major_brand == *b"avif"
+                    || compatible_brands.iter().any(|brand| *brand == *b"avif")
+                {
+                    *b"av01"
+                } else {
+                    *b"hvc1"
+                };
+                let payload = b.read_into_try_vec().map_err(|e| at!(Error::from(e)))?;
+                let mini = read_mini(&payload, 0)?;
+                let item_type = mini.infe_type.unwrap_or(branded);
+                meta = Some(expand_mini(&mini, payload, item_type)?);
+                continue;
             }
             match b.head.name {
                 BoxType::MetadataBox => {
@@ -1979,6 +1994,7 @@ impl<'data> AvifParser<'data> {
                 // A sample entry carries one `colr`, so there is no second
                 // one to report for a file that is only a track.
                 icc_color_info: None,
+                pixel_information: None,
                 rotation: None,
                 mirror: None,
                 clean_aperture: None,
@@ -2490,6 +2506,18 @@ impl<'data> AvifParser<'data> {
             hevc_config,
             color_info,
             icc_color_info,
+            pixel_information: meta.properties.iter().find_map(|p| {
+                match (&p.property, p.item_id == meta.primary_item_id) {
+                    (ItemProperty::Channels(channels), true) => {
+                        let mut out = TryVec::new();
+                        for depth in channels.iter() {
+                            out.push(*depth).ok()?;
+                        }
+                        Some(out)
+                    }
+                    _ => None,
+                }
+            }),
             rotation,
             mirror,
             clean_aperture,
@@ -3060,6 +3088,17 @@ impl<'data> AvifParser<'data> {
 
     pub fn av1_config(&self) -> Option<&AV1Config> {
         self.av1_config.as_ref()
+    }
+
+    /// The primary item's `pixi`: bits per channel, as the container states.
+    ///
+    /// The container's own statement, independent of the codec configuration
+    /// and of the coded stream. Worth having as a last resort: a `mini` box
+    /// declares its depth in the box and may carry a codec configuration this
+    /// reader cannot parse, and then this is all there is.
+    #[must_use]
+    pub fn pixel_information(&self) -> Option<&[u8]> {
+        self.pixel_information.as_deref()
     }
 
     /// Get colour information for the primary item, if present.
@@ -5669,6 +5708,492 @@ mod hvcc_tests {
         let bytes = hvcc_box(0x01, 1, 8, 8, 0x0F, &arrays);
         assert!(parse(&bytes).is_err(), "a NAL running past the box must fail");
     }
+}
+
+/* ---- The low-overhead 'mini' box ---------------------------------------- */
+
+/// A bit reader over the `mini` payload.
+///
+/// The box is bit-packed rather than byte-aligned — that is the whole point
+/// of it — so every field is read at its own width and the reader tracks a
+/// bit position. Reads past the end return zero rather than failing, and the
+/// caller checks the position afterwards: a truncated box then produces
+/// implausible sizes, which the size validation rejects, instead of a
+/// different error at every field.
+struct MiniBits<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+
+impl<'a> MiniBits<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, position: 0 }
+    }
+
+    fn bits(&mut self, count: u32) -> u32 {
+        let mut value = 0u32;
+        for _ in 0..count {
+            let byte = self.position / 8;
+            let bit = 7 - (self.position % 8);
+            let set = self.bytes.get(byte).is_some_and(|b| (b >> bit) & 1 == 1);
+            value = (value << 1) | u32::from(set);
+            self.position += 1;
+        }
+        value
+    }
+
+    fn flag(&mut self) -> bool {
+        self.bits(1) == 1
+    }
+
+    fn align(&mut self) {
+        self.position = self.position.div_ceil(8) * 8;
+    }
+
+    fn byte_position(&self) -> usize {
+        self.position / 8
+    }
+
+    fn ran_out(&self) -> bool {
+        self.position > self.bytes.len() * 8
+    }
+}
+
+/// What a `mini` box says, in the terms the item model uses.
+struct MiniImage {
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    orientation: u8,
+    colour_primaries: u16,
+    transfer_characteristics: u16,
+    matrix_coefficients: u16,
+    full_range: bool,
+    /// Codec configuration and coded bytes, as offsets into the file.
+    main_config: Range<u64>,
+    main_data: Range<u64>,
+    alpha_config: Option<Range<u64>>,
+    alpha_data: Option<Range<u64>>,
+    icc: Option<Range<u64>>,
+    /// The item type the samples are coded in, when the box names it.
+    infe_type: Option<[u8; 4]>,
+}
+
+/// Read a `mini` box, whose payload starts at `file_offset` in the file.
+///
+/// HEIF's third edition (ISO/IEC 23008-12 Annex A) replaces the whole
+/// meta/iinf/iloc/iprp structure with this one bit-packed box for the common
+/// case of a single image. It is a different serialisation of the same model,
+/// so it is read here and expanded into that model rather than given a path
+/// of its own — which is what libheif does with it too.
+fn read_mini(payload: &[u8], file_offset: u64) -> Result<MiniImage> {
+    let mut bits = MiniBits::new(payload);
+
+    let version = bits.bits(2);
+    if version != 0 {
+        return Err(at!(Error::Unsupported("unknown 'mini' box version")));
+    }
+    let explicit_codec_types = bits.flag();
+    let float_flag = bits.flag();
+    let full_range = bits.flag();
+    let alpha_flag = bits.flag();
+    let explicit_cicp = bits.flag();
+    let hdr_flag = bits.flag();
+    let icc_flag = bits.flag();
+    let exif_flag = bits.flag();
+    let xmp_flag = bits.flag();
+    let chroma_subsampling = bits.bits(2);
+    let orientation = (bits.bits(3) + 1) as u8;
+
+    let large_dimensions = bits.flag();
+    let dimension_bits = if large_dimensions { 15 } else { 7 };
+    let width = 1 + bits.bits(dimension_bits);
+    let height = 1 + bits.bits(dimension_bits);
+
+    if chroma_subsampling == 1 || chroma_subsampling == 2 {
+        let _horizontally_centred = bits.flag();
+    }
+    if chroma_subsampling == 1 {
+        let _vertically_centred = bits.flag();
+    }
+
+    let mut bit_depth = 8u8;
+    if float_flag {
+        // Floating-point samples, which nothing downstream here handles.
+        return Err(at!(Error::Unsupported(
+            "floating-point samples in a 'mini' box"
+        )));
+    }
+    if bits.flag() {
+        bit_depth = (bits.bits(3) + 9) as u8;
+    }
+
+    if alpha_flag {
+        let _premultiplied = bits.flag();
+    }
+
+    let (colour_primaries, transfer_characteristics, matrix_coefficients) = if explicit_cicp {
+        (
+            bits.bits(8) as u16,
+            bits.bits(8) as u16,
+            bits.bits(8) as u16,
+        )
+    } else {
+        // Annex A's defaults: an ICC profile means the code points say
+        // nothing, and monochrome has no matrix to name.
+        (
+            if icc_flag { 2 } else { 1 },
+            if icc_flag { 2 } else { 13 },
+            if chroma_subsampling == 0 { 2 } else { 6 },
+        )
+    };
+
+    let infe_type = if explicit_codec_types {
+        let infe = bits.bits(32).to_be_bytes();
+        let _codec_config_type = bits.bits(32);
+        Some(infe)
+    } else {
+        None
+    };
+
+    if hdr_flag {
+        // The HDR block carries gain maps, mastering displays and several
+        // other structures, and it sits between here and the sizes below —
+        // so it cannot be skipped without being parsed. No file in reach
+        // uses it, and guessing at its layout would be worse than saying so.
+        return Err(at!(Error::Unsupported(
+            "HDR extensions in a 'mini' box"
+        )));
+    }
+
+    // Only present when there is metadata for it to size. Reading it
+    // unconditionally consumes a bit that is not there and shifts every
+    // field after it.
+    let large_metadata = (icc_flag || exif_flag || xmp_flag) && bits.flag();
+    let large_codec_config = bits.flag();
+    let large_item_data = bits.flag();
+
+    let icc_size = if icc_flag {
+        bits.bits(if large_metadata { 20 } else { 10 }) + 1
+    } else {
+        0
+    };
+
+    let main_config_size = bits.bits(if large_codec_config { 12 } else { 3 });
+    let main_data_size = bits.bits(if large_item_data { 28 } else { 15 }) + 1;
+
+    let alpha_data_size = if alpha_flag {
+        bits.bits(if large_item_data { 28 } else { 15 })
+    } else {
+        0
+    };
+    let alpha_config_size = if alpha_flag && alpha_data_size > 0 {
+        bits.bits(if large_codec_config { 12 } else { 3 })
+    } else {
+        0
+    };
+
+    if exif_flag || xmp_flag {
+        let _compressed = bits.flag();
+    }
+    let exif_size = if exif_flag {
+        bits.bits(if large_metadata { 20 } else { 10 }) + 1
+    } else {
+        0
+    };
+    let xmp_size = if xmp_flag {
+        bits.bits(if large_metadata { 20 } else { 10 }) + 1
+    } else {
+        0
+    };
+
+    bits.align();
+    if bits.ran_out() {
+        return Err(at!(Error::InvalidData("'mini' box ended mid-header")));
+    }
+
+    // Everything after the header is laid out in this order. Sizes are
+    // checked against what is left before any of it is trusted: a truncated
+    // box otherwise names extents past the end of the file.
+    let mut at = file_offset + bits.byte_position() as u64;
+    let end = file_offset + payload.len() as u64;
+    let mut take = |size: u32| -> Result<Range<u64>> {
+        let start = at;
+        let stop = start
+            .checked_add(u64::from(size))
+            .ok_or_else(|| at!(Error::InvalidData("'mini' extent overflows")))?;
+        if stop > end {
+            return Err(at!(Error::InvalidData(
+                "'mini' box declares more data than it holds"
+            )));
+        }
+        at = stop;
+        Ok(start..stop)
+    };
+
+    // The order the box lays them out in: configurations, then the profile,
+    // then alpha's samples, then the picture's, then the metadata. Alpha
+    // before the picture is the part that is easy to get backwards.
+    let main_config = take(main_config_size)?;
+    let alpha_config = if alpha_flag && alpha_data_size > 0 && alpha_config_size > 0 {
+        Some(take(alpha_config_size)?)
+    } else {
+        None
+    };
+    let icc = if icc_flag { Some(take(icc_size)?) } else { None };
+    let alpha_data = if alpha_flag && alpha_data_size > 0 {
+        Some(take(alpha_data_size)?)
+    } else {
+        None
+    };
+    let main_data = take(main_data_size)?;
+    let _exif = take(exif_size)?;
+    let _xmp = take(xmp_size)?;
+
+    Ok(MiniImage {
+        width,
+        height,
+        bit_depth,
+        orientation,
+        colour_primaries,
+        transfer_characteristics,
+        matrix_coefficients,
+        full_range,
+        main_config,
+        main_data,
+        alpha_config: alpha_config.filter(|_| alpha_flag),
+        alpha_data,
+        icc,
+        infe_type,
+    })
+}
+
+/// Read an `av1C` record out of bare bytes.
+///
+/// The box parser reads it from a `BMFFBox`; a `mini` box holds the same
+/// record with no box around it, so the fields are read from the slice
+/// directly rather than by synthesising a box to read them out of.
+fn read_av1c_bytes(bytes: &[u8]) -> Option<AV1Config> {
+    if bytes.len() < 4 || bytes[0] >> 7 != 1 || bytes[0] & 0x7F != 1 {
+        return None;
+    }
+    let byte2 = bytes[2];
+    let high_bitdepth = (byte2 >> 6) & 1;
+    let twelve_bit = (byte2 >> 5) & 1;
+    Some(AV1Config {
+        profile: bytes[1] >> 5,
+        level: bytes[1] & 0x1F,
+        tier: byte2 >> 7,
+        bit_depth: if twelve_bit == 1 {
+            12
+        } else if high_bitdepth == 1 {
+            10
+        } else {
+            8
+        },
+        monochrome: (byte2 >> 4) & 1 != 0,
+        chroma_subsampling_x: (byte2 >> 3) & 1,
+        chroma_subsampling_y: (byte2 >> 2) & 1,
+        chroma_sample_position: byte2 & 0x03,
+    })
+}
+
+/// Read an `hvcC` record out of bare bytes.
+///
+/// The byte-slice companion of [`read_hvcc`], for a `mini` box, which holds
+/// the record with no box around it. libheif solves the same problem by
+/// wrapping the bytes in a synthetic box header; reading the fields directly
+/// is the same work without the wrapper.
+fn read_hvcc_bytes(bytes: &[u8]) -> Option<HEVCConfig> {
+    // 22 fixed bytes precede the parameter-set arrays.
+    if bytes.len() < 23 || bytes[0] != 1 {
+        return None;
+    }
+    let byte1 = bytes[1];
+    let nal_length_size = (bytes[21] & 0x03) + 1;
+    if nal_length_size == 3 {
+        return None;
+    }
+
+    let mut parameter_sets = TryVec::new();
+    let mut at = 23usize;
+    for _ in 0..bytes[22] {
+        let head = *bytes.get(at)?;
+        at += 1;
+        let nal_unit_type = head & 0x3F;
+        let array_completeness = head >> 7 != 0;
+        let count = u16::from_be_bytes([*bytes.get(at)?, *bytes.get(at + 1)?]);
+        at += 2;
+        for _ in 0..count {
+            let length =
+                usize::from(u16::from_be_bytes([*bytes.get(at)?, *bytes.get(at + 1)?]));
+            at += 2;
+            let slice = bytes.get(at..at + length)?;
+            at += length;
+            let mut data = TryVec::new();
+            for byte in slice {
+                data.push(*byte).ok()?;
+            }
+            parameter_sets
+                .push(HevcParameterSet {
+                    nal_unit_type,
+                    array_completeness,
+                    data,
+                })
+                .ok()?;
+        }
+    }
+
+    Some(HEVCConfig {
+        general_profile_space: byte1 >> 6,
+        general_tier_flag: (byte1 >> 5) & 1 != 0,
+        general_profile_idc: byte1 & 0x1F,
+        general_level_idc: bytes[12],
+        chroma_format_idc: bytes[16] & 0x03,
+        bit_depth_luma: (bytes[17] & 0x07) + 8,
+        bit_depth_chroma: (bytes[18] & 0x07) + 8,
+        nal_length_size,
+        parameter_sets,
+    })
+}
+
+/// Build the item model a `mini` box stands in for.
+///
+/// One primary image item, its codec configuration and spatial extents as
+/// properties, and an alpha item beside it when the box carries one. The
+/// coded bytes live inside the box, so they are carried as `idat` and the
+/// extents index into that -- the construction a `grid` payload already uses
+/// -- rather than as file offsets this reader would have to track.
+fn expand_mini(mini: &MiniImage, payload: TryVec<u8>, item_type: [u8; 4]) -> Result<AvifInternalMeta> {
+    const MAIN: u32 = 1;
+    const ALPHA: u32 = 2;
+
+    let mut item_infos = TryVec::new();
+    item_infos
+        .push(ItemInfoEntry {
+            item_id: MAIN,
+            item_type: FourCC { value: item_type },
+        })
+        .map_err(|e| at!(Error::from(e)))?;
+
+    let mut iloc_items = TryVec::new();
+    let extent = |id: u32, range: &Range<u64>| -> Result<ItemLocationBoxItem> {
+        let mut extents = TryVec::new();
+        extents
+            .push(ItemLocationBoxExtent {
+                extent_range: ExtentRange::WithLength(range.clone()),
+            })
+            .map_err(|e| at!(Error::from(e)))?;
+        Ok(ItemLocationBoxItem {
+            item_id: id,
+            construction_method: ConstructionMethod::Idat,
+            extents,
+        })
+    };
+    iloc_items
+        .push(extent(MAIN, &mini.main_data)?)
+        .map_err(|e| at!(Error::from(e)))?;
+
+    let mut properties = TryVec::new();
+    properties
+        .push(AssociatedProperty {
+            item_id: MAIN,
+            property: ItemProperty::ImageSpatialExtents(ImageSpatialExtents {
+                width: mini.width,
+                height: mini.height,
+            }),
+        })
+        .map_err(|e| at!(Error::from(e)))?;
+    properties
+        .push(AssociatedProperty {
+            item_id: MAIN,
+            property: ItemProperty::ColorInformation(ColorInformation::Nclx {
+                color_primaries: mini.colour_primaries,
+                transfer_characteristics: mini.transfer_characteristics,
+                matrix_coefficients: mini.matrix_coefficients,
+                full_range: mini.full_range,
+            }),
+        })
+        .map_err(|e| at!(Error::from(e)))?;
+
+    // The codec configuration, which the box holds as bare bytes where an
+    // ordinary file holds an `av1C` or `hvcC` property. Without it a reader
+    // knows the picture's size and nothing about how to decode it.
+    let config = payload
+        .get(mini.main_config.start as usize..mini.main_config.end as usize)
+        .unwrap_or(&[]);
+    if !config.is_empty() {
+        let property = if item_type == *b"av01" {
+            read_av1c_bytes(config).map(ItemProperty::AV1Config)
+        } else {
+            read_hvcc_bytes(config).map(ItemProperty::HEVCConfig)
+        };
+        if let Some(property) = property {
+            properties
+                .push(AssociatedProperty {
+                    item_id: MAIN,
+                    property,
+                })
+                .map_err(|e| at!(Error::from(e)))?;
+        }
+    }
+
+    let mut item_references = TryVec::new();
+    if let Some(alpha) = &mini.alpha_data {
+        item_infos
+            .push(ItemInfoEntry {
+                item_id: ALPHA,
+                item_type: FourCC { value: item_type },
+            })
+            .map_err(|e| at!(Error::from(e)))?;
+        iloc_items
+            .push(extent(ALPHA, alpha)?)
+            .map_err(|e| at!(Error::from(e)))?;
+        item_references
+            .push(SingleItemTypeReferenceBox {
+                item_type: FourCC { value: *b"auxl" },
+                from_item_id: ALPHA,
+                to_item_id: MAIN,
+                reference_index: 0,
+            })
+            .map_err(|e| at!(Error::from(e)))?;
+        let mut urn = TryVec::new();
+        for byte in b"urn:mpeg:mpegB:cicp:systems:auxiliary:alpha" {
+            urn.push(*byte).map_err(|e| at!(Error::from(e)))?;
+        }
+        properties
+            .push(AssociatedProperty {
+                item_id: ALPHA,
+                property: ItemProperty::AuxiliaryType(AuxiliaryTypeProperty { aux_data: urn }),
+            })
+            .map_err(|e| at!(Error::from(e)))?;
+    }
+
+    // The box states its own depth, which is the only statement of it when
+    // the codec configuration cannot be read. `pixi` is where an ordinary
+    // file puts the same fact.
+    let mut channels = ArrayVec::new();
+    for _ in 0..3 {
+        let _ = channels.try_push(mini.bit_depth);
+    }
+    properties
+        .push(AssociatedProperty {
+            item_id: MAIN,
+            property: ItemProperty::Channels(channels),
+        })
+        .map_err(|e| at!(Error::from(e)))?;
+
+    let _ = (&mini.alpha_config, &mini.icc, mini.orientation);
+
+    Ok(AvifInternalMeta {
+        item_references,
+        properties,
+        primary_item_id: MAIN,
+        iloc_items,
+        item_infos,
+        idat: Some(payload),
+        entity_groups: TryVec::new(),
+    })
 }
 
 /// Parse a Colour Information property box
