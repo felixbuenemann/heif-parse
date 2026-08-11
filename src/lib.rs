@@ -1188,6 +1188,64 @@ impl TryClone for UncompressedFrameConfig {
     }
 }
 
+/// The `cmpC` box: how an item's bytes were compressed (ISO/IEC 23001-17).
+///
+/// A generic-compression wrapper around an item that is otherwise ordinary —
+/// most usefully around a `unci` item, whose samples compress well and whose
+/// layout is unchanged by it. Decompress, then read what is underneath.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompressionConfiguration {
+    /// The four-character compression type: `defl` for raw DEFLATE, `zlib`
+    /// for the same inside a zlib wrapper, `brot` for Brotli.
+    pub compression_type: [u8; 4],
+    /// What one compressed unit covers: 0 the whole item, 1 one tile, 2 one
+    /// row, 3 one pixel.
+    ///
+    /// Anything but 0 needs the `icef` box to say where each unit begins, so
+    /// the two are read together in practice even though the file may carry
+    /// either alone.
+    pub compressed_unit_type: u8,
+}
+
+/// One compressed unit's place in an item's payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompressedExtent {
+    pub offset: u64,
+    pub size: u64,
+}
+
+impl TryClone for CompressedExtent {
+    fn try_clone(&self) -> Result<Self, TryReserveError> {
+        Ok(*self)
+    }
+}
+
+/// The `icef` box: where each compressed unit of an item begins and ends.
+#[derive(Debug, Default)]
+pub struct ItemCompressedExtents {
+    extents: TryVec<CompressedExtent>,
+}
+
+impl ItemCompressedExtents {
+    /// The units, in the order they appear in the item's payload.
+    #[must_use]
+    pub fn extents(&self) -> &[CompressedExtent] {
+        &self.extents
+    }
+}
+
+impl PartialEq for ItemCompressedExtents {
+    fn eq(&self, other: &Self) -> bool {
+        self.extents.as_slice() == other.extents.as_slice()
+    }
+}
+
+impl TryClone for ItemCompressedExtents {
+    fn try_clone(&self) -> Result<Self, TryReserveError> {
+        Ok(Self { extents: self.extents.try_clone()? })
+    }
+}
+
 /// Options for parsing AVIF files
 ///
 /// Prefer using [`DecodeConfig::lenient()`] with [`AvifParser`] instead.
@@ -1869,6 +1927,8 @@ pub struct AvifParser<'data> {
     alpha_hevc_config: Option<HEVCConfig>,
     component_definition: Option<ComponentDefinition>,
     uncompressed_config: Option<UncompressedFrameConfig>,
+    compression_config: Option<CompressionConfiguration>,
+    compressed_extents: Option<ItemCompressedExtents>,
     color_info: Option<ColorInformation>,
     icc_color_info: Option<ColorInformation>,
     pixel_information: Option<TryVec<u8>>,
@@ -2154,6 +2214,8 @@ impl<'data> AvifParser<'data> {
                 alpha_hevc_config: None,
                 component_definition: None,
                 uncompressed_config: None,
+                compression_config: None,
+                compressed_extents: None,
                 color_info: track_config.color_info,
                 // A sample entry carries one `colr`, so there is no second
                 // one to report for a file that is only a track.
@@ -2574,6 +2636,8 @@ impl<'data> AvifParser<'data> {
         // they are read together and offered together.
         let mut component_definition = None;
         let mut uncompressed_config = None;
+        let mut compression_config = None;
+        let mut compressed_extents = None;
         for property in &meta.properties {
             if property.item_id != meta.primary_item_id {
                 continue;
@@ -2586,6 +2650,13 @@ impl<'data> AvifParser<'data> {
                 ItemProperty::UncompressedFrameConfig(config) if uncompressed_config.is_none() => {
                     uncompressed_config =
                         Some(config.try_clone().map_err(|e| at!(Error::from(e)))?);
+                }
+                ItemProperty::CompressionConfiguration(config) if compression_config.is_none() => {
+                    compression_config = Some(*config);
+                }
+                ItemProperty::ItemCompressedExtents(extents) if compressed_extents.is_none() => {
+                    compressed_extents =
+                        Some(extents.try_clone().map_err(|e| at!(Error::from(e)))?);
                 }
                 _ => {}
             }
@@ -2675,6 +2746,8 @@ impl<'data> AvifParser<'data> {
             alpha_hevc_config,
             component_definition,
             uncompressed_config,
+            compression_config,
+            compressed_extents,
             color_info,
             icc_color_info,
             pixel_information: meta.properties.iter().find_map(|p| {
@@ -3278,6 +3351,26 @@ impl<'data> AvifParser<'data> {
     #[must_use]
     pub fn uncompressed_config(&self) -> Option<&UncompressedFrameConfig> {
         self.uncompressed_config.as_ref()
+    }
+
+    /// How the primary item's bytes were compressed, if they were.
+    ///
+    /// A generic-compression wrapper sits OUTSIDE whatever the item actually
+    /// is: decompress first, then read the result as the item's own
+    /// properties describe. Present alongside
+    /// [`Self::uncompressed_config`] in a compressed `unci` item.
+    #[must_use]
+    pub fn compression_config(&self) -> Option<&CompressionConfiguration> {
+        self.compression_config.as_ref()
+    }
+
+    /// Where each compressed unit of the primary item begins and ends.
+    ///
+    /// Absent where the whole item is one unit, which is the only case that
+    /// needs no map.
+    #[must_use]
+    pub fn compressed_extents(&self) -> Option<&ItemCompressedExtents> {
+        self.compressed_extents.as_ref()
     }
 
     /// The HEVC configuration from the track's sample entry, if there is one.
@@ -5448,6 +5541,8 @@ pub(crate) enum ItemProperty {
     AV1LayeredImageIndexing(AV1LayeredImageIndexing),
     ComponentDefinition(ComponentDefinition),
     UncompressedFrameConfig(UncompressedFrameConfig),
+    CompressionConfiguration(CompressionConfiguration),
+    ItemCompressedExtents(ItemCompressedExtents),
     Unsupported,
 }
 
@@ -5474,6 +5569,8 @@ impl TryClone for ItemProperty {
             Self::AV1LayeredImageIndexing(val) => Self::AV1LayeredImageIndexing(*val),
             Self::ComponentDefinition(val) => Self::ComponentDefinition(val.try_clone()?),
             Self::UncompressedFrameConfig(val) => Self::UncompressedFrameConfig(val.try_clone()?),
+            Self::CompressionConfiguration(val) => Self::CompressionConfiguration(*val),
+            Self::ItemCompressedExtents(val) => Self::ItemCompressedExtents(val.try_clone()?),
             Self::Unsupported => Self::Unsupported,
         })
     }
@@ -5660,6 +5757,8 @@ fn read_ipco<T: Read>(src: &mut BMFFBox<'_, T>, options: &ParseOptions) -> Resul
             BoxType::AV1LayeredImageIndexingBox => ItemProperty::AV1LayeredImageIndexing(read_a1lx(&mut b)?),
             BoxType::ComponentDefinitionBox => ItemProperty::ComponentDefinition(read_cmpd(&mut b, options)?),
             BoxType::UncompressedFrameConfigBox => ItemProperty::UncompressedFrameConfig(read_uncc(&mut b, options)?),
+            BoxType::CompressionConfigurationBox => ItemProperty::CompressionConfiguration(read_cmpc(&mut b, options)?),
+            BoxType::ItemCompressedExtentsBox => ItemProperty::ItemCompressedExtents(read_icef(&mut b, options)?),
             _ => {
                 skip_box_remain(&mut b)?;
                 ItemProperty::Unsupported
@@ -5784,6 +5883,81 @@ fn read_uncc<T: Read>(src: &mut BMFFBox<'_, T>, options: &ParseOptions) -> Resul
     config.num_tile_rows = rows_minus_one + 1;
     skip_box_remain(src)?;
     Ok(config)
+}
+
+/// Read a `cmpC` compression configuration box (ISO/IEC 23001-17 section 6).
+fn read_cmpc<T: Read>(src: &mut BMFFBox<'_, T>, options: &ParseOptions) -> Result<CompressionConfiguration> {
+    let version = read_fullbox_version_no_flags(src, options)?;
+    if version != 0 {
+        return Err(at!(Error::Unsupported("cmpC version")));
+    }
+    let compression_type = be_u32(src)?.to_be_bytes();
+    let compressed_unit_type = src.read_u8().map_err(|e| at!(Error::from(e)))?;
+    skip_box_remain(src)?;
+    Ok(CompressionConfiguration { compression_type, compressed_unit_type })
+}
+
+/// Read an `icef` item compressed extents box (ISO/IEC 23001-17 section 6).
+///
+/// The offsets and sizes are stored at a width the box itself chooses, so the
+/// two three-bit codes in the first byte have to be read before anything
+/// else can be. An offset code of zero means the offsets are not stored at
+/// all: each unit begins where the previous one ended.
+fn read_icef<T: Read>(src: &mut BMFFBox<'_, T>, options: &ParseOptions) -> Result<ItemCompressedExtents> {
+    const OFFSET_BITS: [u8; 5] = [0, 16, 24, 32, 64];
+    const SIZE_BITS: [u8; 5] = [8, 16, 24, 32, 64];
+    let version = read_fullbox_version_no_flags(src, options)?;
+    if version != 0 {
+        return Err(at!(Error::Unsupported("icef version")));
+    }
+    let codes = src.read_u8().map_err(|e| at!(Error::from(e)))?;
+    let offset_code = usize::from((codes & 0b1110_0000) >> 5);
+    let size_code = usize::from((codes & 0b0001_1100) >> 2);
+    let offset_bits = *OFFSET_BITS
+        .get(offset_code)
+        .ok_or_else(|| at!(Error::Unsupported("icef unit offset code")))?;
+    let size_bits = *SIZE_BITS
+        .get(size_code)
+        .ok_or_else(|| at!(Error::Unsupported("icef unit size code")))?;
+    let count = be_u32(src)?;
+    // Each unit occupies a known number of bits, so the box bounds the count
+    // before anything is allocated for it. Without this a one-byte-per-unit
+    // encoding names as many units as the file has bytes and allocates
+    // sixteen times that.
+    let per_unit = u64::from(offset_bits) + u64::from(size_bits);
+    if per_unit == 0 || u64::from(count) > src.bytes_left() * 8 / per_unit {
+        return Err(at!(Error::InvalidData("icef unit count exceeds box")));
+    }
+    let mut extents = TryVec::new();
+    let mut implied = 0u64;
+    let mut read_uint = |bits: u8| -> Result<u64> {
+        let mut value = 0u64;
+        for _ in 0..bits / 8 {
+            value = (value << 8) | u64::from(src.read_u8().map_err(|e| at!(Error::from(e)))?);
+        }
+        Ok(value)
+    };
+    for _ in 0..count {
+        let offset = if offset_bits == 0 {
+            implied
+        } else {
+            read_uint(offset_bits)?
+        };
+        let size = read_uint(size_bits)?;
+        // An offset plus a size that wraps describes an extent no read can
+        // be bounded against.
+        if size > u64::MAX - offset {
+            return Err(at!(Error::InvalidData("icef extent exceeds the 64-bit range")));
+        }
+        if offset_bits == 0 {
+            implied = implied.saturating_add(size);
+        }
+        extents
+            .push(CompressedExtent { offset, size })
+            .map_err(|e| at!(Error::from(e)))?;
+    }
+    skip_box_remain(src)?;
+    Ok(ItemCompressedExtents { extents })
 }
 
 fn read_pixi<T: Read>(src: &mut BMFFBox<'_, T>, options: &ParseOptions) -> Result<ArrayVec<u8, 16>> {

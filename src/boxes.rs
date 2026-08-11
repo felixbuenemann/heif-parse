@@ -163,6 +163,8 @@ box_database!(
     AV1LayeredImageIndexingBox        0x6131_6c78, // "a1lx"
     ComponentDefinitionBox            0x636d_7064, // "cmpd" - ISO/IEC 23001-17
     UncompressedFrameConfigBox        0x756e_6343, // "uncC" - ISO/IEC 23001-17
+    CompressionConfigurationBox       0x636d_7043, // "cmpC" - ISO/IEC 23001-17
+    ItemCompressedExtentsBox          0x6963_6566, // "icef" - ISO/IEC 23001-17
     FLACSampleEntry                   0x664c_6143, // "fLaC"
     FLACSpecificBox                   0x6466_4c61, // "dfLa"
     OpusSampleEntry                   0x4f70_7573, // "Opus"
