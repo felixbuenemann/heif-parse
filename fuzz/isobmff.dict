@@ -1,4 +1,4 @@
-# ISOBMFF/HEIF/AVIF fuzzing dictionary for zenavif-parse
+# ISOBMFF/HEIF/AVIF fuzzing dictionary for heif-parse
 # Generated from parser source code and ISOBMFF/HEIF/AVIF specifications
 #
 # Box types, brands, handler types, item types, reference types,

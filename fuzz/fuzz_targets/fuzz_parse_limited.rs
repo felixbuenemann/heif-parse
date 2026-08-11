@@ -3,13 +3,13 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    let config = zenavif_parse::DecodeConfig::default()
+    let config = heif_parse::DecodeConfig::default()
         .with_peak_memory_limit(64 * 1024 * 1024)
         .with_total_megapixels_limit(16)
         .with_max_animation_frames(100)
         .with_max_grid_tiles(64);
 
-    if let Ok(parser) = zenavif_parse::AvifParser::from_bytes_with_config(
+    if let Ok(parser) = heif_parse::AvifParser::from_bytes_with_config(
         data, &config, &enough::Unstoppable,
     ) {
         let _ = parser.primary_data();

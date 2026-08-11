@@ -1,4 +1,4 @@
-# zenavif-parse public API — supported surface (default features)
+# heif-parse public API — supported surface (default features)
 # (regenerated on every `cargo test` by zenutils-apidoc; ZEN_API_DOC=check verifies, =off skips).
 # Encodings: crate-name prefix stripped; auto traits collapse to a
 # count + exceptions; trait impls collapse to one roster line per
@@ -6,7 +6,7 @@
 # impls omitted; re-export duplicates annotated `[also: path]`.
 # DO NOT EDIT BY HAND — commit regenerated changes with the code.
 #
-# files: zenavif-parse.txt 227 lines (supported surface) | zenavif-parse.features.txt 61 added (features: c_api,eager,zencodec) | zenavif-parse.internal.txt 33 lines (33 hidden + 0 excluded-feature)
+# files: heif-parse.txt 227 lines (supported surface) | heif-parse.features.txt 61 added (features: c_api,eager,zencodec) | heif-parse.internal.txt 33 lines (33 hidden + 0 excluded-feature)
 
 ## summary
 #
@@ -27,7 +27,7 @@
 
 ## items (194 lines)
 
-pub mod zenavif_parse
+pub mod heif_parse
 pub use Stop
 pub use StopReason
 pub use Unstoppable

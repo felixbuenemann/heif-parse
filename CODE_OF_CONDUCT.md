@@ -1,4 +1,4 @@
-> **Note:** This Code of Conduct is inherited from the upstream avif-parse project (Mozilla). For zenavif-parse issues, contact the Imazen team.
+> **Note:** This Code of Conduct is inherited from the upstream avif-parse project (Mozilla). For heif-parse issues, contact the Imazen team.
 
 # Community Participation Guidelines
 

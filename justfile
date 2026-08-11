@@ -1,4 +1,4 @@
-# zenavif-parse dev commands
+# heif-parse dev commands
 
 # Format + regenerate the public-API surface snapshots (docs/public-api/).
 # The snapshot runner lives in the standalone apidoc/ package, so it is

@@ -1,6 +1,6 @@
 <!-- GENERATED FROM README.md by zenutils gen-readme-crates.sh — DO NOT EDIT. -->
 
-# zenavif-parse
+# heif-parse
 
 AVIF container parser (ISOBMFF/MIAF demuxer) that extracts AV1 payloads, alpha channels, grid tiles, and animation frames from AVIF files. Written entirely in safe Rust with fallible allocations throughout.
 
@@ -10,11 +10,11 @@ This is a fork of [kornelski/avif-parse](https://github.com/kornelski/avif-parse
 
 ```toml
 [dependencies]
-zenavif-parse = "0.6"
+heif-parse = "0.6"
 ```
 
 ```rust
-use zenavif_parse::AvifParser;
+use heif_parse::AvifParser;
 
 // Parse the container — zero-copy: it records byte offsets, it doesn't copy mdat.
 let bytes = std::fs::read("image.avif")?;
@@ -54,7 +54,7 @@ The original `read_avif()` / `AvifData` API is preserved for backwards compatibi
 ### Zero-copy parser (recommended)
 
 ```rust
-use zenavif_parse::AvifParser;
+use heif_parse::AvifParser;
 
 let bytes = std::fs::read("image.avif")?;
 let parser = AvifParser::from_bytes(&bytes)?;
@@ -144,7 +144,7 @@ if let Some(info) = parser.animation_info() {
 sequence header (and first frame header) — no AV1 decode:
 
 ```rust
-let meta = parser.primary_metadata()?;   // -> zenavif_parse::AV1Metadata
+let meta = parser.primary_metadata()?;   // -> heif_parse::AV1Metadata
 println!("{}x{}, {}bpc, chroma {:?}",
     meta.max_frame_width, meta.max_frame_height,
     meta.bit_depth, meta.chroma_subsampling);
@@ -160,7 +160,7 @@ bitstream. AVIF places the canonical color description in the container, and an
 which returns `Option<&ColorInformation>`:
 
 ```rust
-use zenavif_parse::ColorInformation;
+use heif_parse::ColorInformation;
 
 match parser.color_info() {
     Some(ColorInformation::Nclx {
@@ -202,25 +202,25 @@ parameters.
 
 ### Error and metadata types
 
-- **Result / error type.** Public methods return `zenavif_parse::Result<T>`, which is
-  `Result<T, whereat::At<zenavif_parse::Error>>` — the error is wrapped in
+- **Result / error type.** Public methods return `heif_parse::Result<T>`, which is
+  `Result<T, whereat::At<heif_parse::Error>>` — the error is wrapped in
   [`whereat::At`](https://docs.rs/whereat) to carry source-location frames. Both
-  `zenavif_parse::Error` and `whereat::At<Error>` implement `std::error::Error`, so `?`
+  `heif_parse::Error` and `whereat::At<Error>` implement `std::error::Error`, so `?`
   propagates cleanly into `Box<dyn std::error::Error>` / `anyhow::Error` (as the examples
   here do). To inspect the inner enum, use `at.error()` (borrow) or `at.decompose()`
   (consume). `Error` variants include `InvalidData`, `Unsupported`, `UnexpectedEOF`,
   `Io`, `NoMoov`, `OutOfMemory`, `ResourceLimitExceeded`, and `Stopped` (cancellation).
 - **Color type.** `color_info()` / `gain_map_color_info()` return
-  `Option<&zenavif_parse::ColorInformation>` (enum: `Nclx { .. }` or `IccProfile(Vec<u8>)`).
+  `Option<&heif_parse::ColorInformation>` (enum: `Nclx { .. }` or `IccProfile(Vec<u8>)`).
 - **Metadata type.** `primary_metadata()` / `alpha_metadata()` return
-  `zenavif_parse::AV1Metadata` (a `#[non_exhaustive]` struct: `still_picture`,
+  `heif_parse::AV1Metadata` (a `#[non_exhaustive]` struct: `still_picture`,
   `max_frame_width`, `max_frame_height`, `bit_depth`, `seq_profile`,
   `chroma_subsampling`, `monochrome`, `base_q_idx`, `lossless`).
 
 ### Resource limits
 
 ```rust
-use zenavif_parse::{AvifParser, DecodeConfig};
+use heif_parse::{AvifParser, DecodeConfig};
 
 let config = DecodeConfig::default()
     .with_peak_memory_limit(64 * 1024 * 1024)   // 64MB
@@ -253,16 +253,16 @@ The `zencodec` feature enables bidirectional `From` conversions between
 
 ```toml
 [dependencies]
-zenavif-parse = { version = "0.6", features = ["zencodec"] }
+heif-parse = { version = "0.6", features = ["zencodec"] }
 zencodec = "0.1"
 ```
 
 ```rust
-// zenavif-parse rationals → zencodec f64 domain
+// heif-parse rationals → zencodec f64 domain
 let params: zencodec::GainMapParams = zencodec::GainMapParams::from(&metadata);
 
-// zencodec f64 domain → zenavif-parse rationals (continued-fraction encoding)
-let metadata: zenavif_parse::GainMapMetadata = zenavif_parse::GainMapMetadata::from(&params);
+// zencodec f64 domain → heif-parse rationals (continued-fraction encoding)
+let metadata: heif_parse::GainMapMetadata = heif_parse::GainMapMetadata::from(&params);
 ```
 
 Rational fractions are encoded using the continued-fraction algorithm, matching
@@ -274,11 +274,11 @@ The original `read_avif()` / `AvifData` API and C FFI are behind the `eager` fea
 
 ```toml
 [dependencies]
-zenavif-parse = { version = "0.6", features = ["eager"] }
+heif-parse = { version = "0.6", features = ["eager"] }
 ```
 
 ```rust
-use zenavif_parse::read_avif;
+use heif_parse::read_avif;
 
 let data = read_avif(&mut reader)?;
 decode_av1(&data.primary_item)?;
@@ -300,14 +300,14 @@ This crate builds directly on work by:
 
 ## License
 
-MPL-2.0 — see [`LICENSE`](https://github.com/imazen/zenavif-parse/blob/main/LICENSE), unchanged from upstream [avif-parse](https://github.com/kornelski/avif-parse). Every change in this fork is offered back under that same license; see [Upstream contributions welcome](#upstream-contributions-welcome) above.
+MPL-2.0 — see [`LICENSE`](https://github.com/felixbuenemann/heif-parse/blob/main/LICENSE), unchanged from upstream [avif-parse](https://github.com/kornelski/avif-parse). Every change in this fork is offered back under that same license; see [Upstream contributions welcome](#upstream-contributions-welcome) above.
 
 ## Image tech I maintain
 
 | | |
 |:--|:--|
 | **Codecs** ¹ | [zenjpeg] · [zenpng] · [zenwebp] · [zengif] · [zenavif] · [zenjxl] · [zenbitmaps] · [heic] · [zentiff] · [zenpdf] · [zensvg] · [zenjp2] · [zenraw] · [ultrahdr] |
-| Codec internals | [zenjxl-decoder] · [jxl-encoder] · [zenrav1e] · [rav1d-safe] · **zenavif-parse** · [zenavif-serialize] |
+| Codec internals | [zenjxl-decoder] · [jxl-encoder] · [zenrav1e] · [rav1d-safe] · **heif-parse** · [heif-serialize] |
 | Compression | [zenflate] · [zenzop] · [zenzstd] |
 | Processing | [zenresize] · [zenquant] · [zenblend] · [zenfilters] · [zensally] · [zentone] |
 | Pixels & color | [zenpixels] · [zenpixels-convert] · [linear-srgb] · [garb] |
@@ -342,7 +342,7 @@ MPL-2.0 — see [`LICENSE`](https://github.com/imazen/zenavif-parse/blob/main/LI
 [jxl-encoder]: https://github.com/imazen/jxl-encoder
 [zenrav1e]: https://github.com/imazen/zenrav1e
 [rav1d-safe]: https://github.com/imazen/rav1d-safe
-[zenavif-serialize]: https://github.com/imazen/zenavif-serialize
+[heif-serialize]: https://github.com/felixbuenemann/heif-serialize
 [zenflate]: https://github.com/imazen/zenflate
 [zenzop]: https://github.com/imazen/zenzop
 [zenzstd]: https://github.com/imazen/zenzstd

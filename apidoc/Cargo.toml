@@ -5,7 +5,7 @@
 # ones) never compile the apidoc tree or run rustdoc. Regenerate via
 # `just api-doc`.
 [package]
-name = "zenavif-parse-apidoc"
+name = "heif-parse-apidoc"
 version = "0.0.0"
 edition = "2024"
 publish = false

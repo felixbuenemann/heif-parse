@@ -1,5 +1,5 @@
 #![allow(deprecated)]
-use zenavif_parse::AvifData;
+use heif_parse::AvifData;
 use std::path::PathBuf;
 use std::{env, fs};
 

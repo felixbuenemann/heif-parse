@@ -1,5 +1,5 @@
 //! Test streaming animation parser
-use zenavif_parse::AvifParser;
+use heif_parse::AvifParser;
 
 fn main() {
     env_logger::init();

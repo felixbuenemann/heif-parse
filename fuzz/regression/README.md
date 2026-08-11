@@ -1,7 +1,7 @@
 # Fuzz regression seeds
 
 This directory holds previously-found crash inputs that have been fixed.
-The `cargo test -p zenavif-parse --test fuzz_regression` harness walks
+The `cargo test -p heif-parse --test fuzz_regression` harness walks
 this directory (recursively, ignoring dotfiles and README.md) and runs
 each file through every entry point the fuzz targets cover.
 
@@ -13,4 +13,4 @@ To add a seed:
 4. Re-run the regression harness to confirm it passes on the fix.
 
 Per CLAUDE.md "Fuzz Corpus & Crash Storage": the working fuzz corpus and
-unminimized crashes live in `/mnt/v/fuzzes/zenavif-parse/`, NOT in git.
+unminimized crashes live in `/mnt/v/fuzzes/heif-parse/`, NOT in git.

@@ -3,7 +3,7 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    if let Ok(parser) = zenavif_parse::AvifParser::from_bytes(data) {
+    if let Ok(parser) = heif_parse::AvifParser::from_bytes(data) {
         let _ = parser.primary_data();
         let _ = parser.alpha_data();
         let _ = parser.animation_info();

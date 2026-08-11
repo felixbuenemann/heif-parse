@@ -1,5 +1,5 @@
 [package]
-name = "zenavif-parse"
+name = "heif-parse"
 version = "0.7.0"
 authors = [
   "Lilith River <lilith@imazen.io>",
@@ -13,7 +13,7 @@ edition = "2024"
 description = "AVIF container parser with zero-copy AvifParser API, grid images, animation, and resource limits. Fork of avif-parse."
 license = "MPL-2.0"
 categories = ["multimedia::images"]
-repository = "https://github.com/imazen/zenavif-parse"
+repository = "https://github.com/felixbuenemann/heif-parse"
 readme = "README.crates.md"
 include = ["/README.crates.md", "/CHANGELOG.md", "/Cargo.toml", "/LICENSE", "/src/*.rs", "/examples/*.rs"]
 keywords = ["avif", "image", "parser", "demuxer", "heif"]

@@ -27,7 +27,7 @@ from commit `c36b822`**, the pre-break release-prep point (CI green there).
   `ispe` property. The accessor never parses the AV1 payload.
 - **Adopt the `zencodec` `CategorizedError` taxonomy (PR #103), on the released
   `zencodec 0.1.26`.** `Error` now `impl zencodec::CategorizedError` with
-  `codec_name() == Some("zenavif-parse")` (a `&self` method, not an associated
+  `codec_name() == Some("heif-parse")` (a `&self` method, not an associated
   const, so the trait stays dyn-compatible) and an exhaustive `category()`
   mapping every variant to one coarse `zencodec::ErrorCategory`, so consumers
   route on the category (HTTP status, retry policy, logging) without naming
@@ -90,7 +90,7 @@ from commit `c36b822`**, the pre-break release-prep point (CI green there).
   `LimitsExceeded(InputSize)` → `Resource(Limits(InputSize))`); no parsing or
   classification behavior changed. Landed together with the dependency swap
   from the temporary git-patch to the real `zencodec 0.1.26` release, so this
-  is a same-cycle correction — zenavif-parse has not shipped either shape.
+  is a same-cycle correction — heif-parse has not shipped either shape.
 - **`category()` no longer collapses every `ResourceLimitExceeded` into a
   single `LimitsExceeded(Pixels)`** (4c41181d). The still-unreleased taxonomy
   impl above originally mapped all 5 resource-cap labels this crate
@@ -128,7 +128,7 @@ from commit `c36b822`**, the pre-break release-prep point (CI green there).
 
 
 ### Added
-- Versioned public-API surface snapshot at `docs/public-api/zenavif-parse.txt`,
+- Versioned public-API surface snapshot at `docs/public-api/heif-parse.txt`,
   regenerated on every `cargo test` via `tests/public_api_doc.rs`
   (`ZEN_API_DOC=check` verifies in CI's clippy job, `=off` skips elsewhere).
   Justfile recipes `api-doc` / `api-doc-check`.

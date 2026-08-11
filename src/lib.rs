@@ -233,14 +233,14 @@ impl From<enough::StopReason> for Error {
 // this enum. `zencodec` is a *hard* dependency of this crate (the legacy
 // `zencodec` cargo feature is a deprecated no-op), so the impl is unconditional.
 //
-// `codec_name()` is `Some("zenavif-parse")`: this is the container demuxer's own
+// `codec_name()` is `Some("heif-parse")`: this is the container demuxer's own
 // crate, and when the sibling `zenavif` codec wraps a parse error it delegates
 // only the `category()` (its own `CategorizedError` reports
 // `codec_name() == Some("zenavif")`), so this name is what a consumer sees only
 // when using the parser directly.
 impl zencodec::CategorizedError for Error {
     fn codec_name(&self) -> Option<&'static str> {
-        Some("zenavif-parse")
+        Some("heif-parse")
     }
 
     fn category(&self) -> zencodec::ErrorCategory {
@@ -328,7 +328,7 @@ mod error_category_tests {
 
     #[test]
     fn error_category_mapping() {
-        assert_eq!(Error::InvalidData("x").codec_name(), Some("zenavif-parse"));
+        assert_eq!(Error::InvalidData("x").codec_name(), Some("heif-parse"));
 
         // Malformed / corrupt container content.
         assert_eq!(Error::InvalidData("bad").category(), C::Image(ImageError::Malformed));
@@ -393,7 +393,7 @@ mod error_category_tests {
         // The blanket `impl CategorizedError for At<E>` forwards both axes.
         let at_err = whereat::At::from(Error::InvalidData("x"));
         assert_eq!(at_err.category(), C::Image(ImageError::Malformed));
-        assert_eq!(at_err.codec_name(), Some("zenavif-parse"));
+        assert_eq!(at_err.codec_name(), Some("heif-parse"));
     }
 }
 
@@ -796,7 +796,7 @@ impl GainMapMetadata {
     ///
     /// This is the inverse of the internal `parse_tone_map_image` function and
     /// produces the exact byte sequence expected in an AVIF `tmap` item. The
-    /// output can be passed to `zenavif_serialize::Aviffy::set_gain_map` or
+    /// output can be passed to `heif_serialize::Aviffy::set_gain_map` or
     /// used for byte-level roundtrip testing.
     ///
     /// Always writes the full (non-common-denominator) wire form: inputs that
@@ -929,7 +929,7 @@ impl From<&zencodec::GainMapParams> for GainMapMetadata {
 ///
 /// ```no_run
 /// let bytes = std::fs::read("hdr.avif").unwrap();
-/// let parser = zenavif_parse::AvifParser::from_bytes(&bytes).unwrap();
+/// let parser = heif_parse::AvifParser::from_bytes(&bytes).unwrap();
 /// if let Some(Ok(gm)) = parser.gain_map() {
 ///     println!("Gain map: {} bytes", gm.gain_map_data.len());
 ///     println!("Multichannel: {}", gm.metadata.is_multichannel);
@@ -963,7 +963,7 @@ pub struct AvifGainMap {
 ///
 /// ```no_run
 /// let bytes = std::fs::read("portrait.avif").unwrap();
-/// let parser = zenavif_parse::AvifParser::from_bytes(&bytes).unwrap();
+/// let parser = heif_parse::AvifParser::from_bytes(&bytes).unwrap();
 /// if let Some(Ok(dm)) = parser.depth_map() {
 ///     println!("Depth map: {}x{}, {} bytes AV1 data", dm.width, dm.height, dm.data.len());
 /// }
@@ -1081,7 +1081,7 @@ pub struct ParseOptions {
 /// # Examples
 ///
 /// ```rust
-/// use zenavif_parse::DecodeConfig;
+/// use heif_parse::DecodeConfig;
 ///
 /// // Default limits (suitable for most apps)
 /// let config = DecodeConfig::default();
@@ -1394,7 +1394,7 @@ pub struct AvifData {
     /// use std::fs::File;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// #[allow(deprecated)]
-    /// let data = zenavif_parse::read_avif(&mut File::open("image.avif")?)?;
+    /// let data = heif_parse::read_avif(&mut File::open("image.avif")?)?;
     ///
     /// if let Some(grid) = data.grid_config {
     ///     println!("Grid: {}×{} tiles", grid.rows, grid.columns);
@@ -1708,7 +1708,7 @@ struct ItemExtents {
 /// # Example
 ///
 /// ```no_run
-/// use zenavif_parse::AvifParser;
+/// use heif_parse::AvifParser;
 ///
 /// let bytes = std::fs::read("image.avif")?;
 /// let parser = AvifParser::from_bytes(&bytes)?;
@@ -3312,7 +3312,7 @@ impl<'data> AvifParser<'data> {
     ///
     /// ```no_run
     /// let bytes = std::fs::read("portrait.avif").unwrap();
-    /// let parser = zenavif_parse::AvifParser::from_bytes(&bytes).unwrap();
+    /// let parser = heif_parse::AvifParser::from_bytes(&bytes).unwrap();
     /// if let Some(Ok(dm)) = parser.depth_map() {
     ///     println!("Depth: {}x{}, {} bytes", dm.width, dm.height, dm.data.len());
     /// }
@@ -5815,7 +5815,7 @@ mod hvcc_tests {
         assert!(parse(&bytes).is_err(), "only configurationVersion 1 is defined");
     }
 
-    /// Bytes emitted by zenavif-serialize's HvcCBox for the same record this
+    /// Bytes emitted by heif-serialize's HvcCBox for the same record this
     /// module builds by hand. Pinned here so the two crates cannot drift apart
     /// without one of them failing: the writer's own tests check these against
     /// the spec's offsets, and this checks that the reader agrees.

@@ -1,4 +1,4 @@
-# AVIF 1.2 Spec Compliance — zenavif-parse
+# AVIF 1.2 Spec Compliance — heif-parse
 
 Compared against https://github.com/AOMediaCodec/av1-avif/blob/main/index.bs (v1.2.0)
 and libavif (AOMediaCodec/libavif) as of 2026-02-13.
@@ -40,9 +40,9 @@ and libavif (AOMediaCodec/libavif) as of 2026-02-13.
 ### Priority 3 — HDR metadata
 
 - [x] clli — Content Light Level Info
-- [x] mdcv — Mastering Display Colour Volume (zenavif-parse parses into typed struct; libavif stores as opaque blob)
-- [x] cclv — Content Colour Volume (zenavif-parse parses into typed struct; libavif stores as opaque blob)
-- [x] amve — Ambient Viewing Environment (zenavif-parse parses into typed struct; libavif stores as opaque blob)
+- [x] mdcv — Mastering Display Colour Volume (heif-parse parses into typed struct; libavif stores as opaque blob)
+- [x] cclv — Content Colour Volume (heif-parse parses into typed struct; libavif stores as opaque blob)
+- [x] amve — Ambient Viewing Environment (heif-parse parses into typed struct; libavif stores as opaque blob)
 
 ### Priority 4 — Container-level validation
 
@@ -70,14 +70,14 @@ and libavif (AOMediaCodec/libavif) as of 2026-02-13.
 ### P2 — Nice-to-have conformance
 
 - [ ] **Brand validation** — Check `miaf` in compatible_brands per spec requirement. Trivial; warn or error if missing.
-- [ ] **Opaque property forwarding** — libavif forwards unrecognized properties as opaque blobs via `avifImage::properties`. zenavif-parse drops them as `Unsupported`. Low impact but improves extensibility for callers who want to inspect unknown boxes.
+- [ ] **Opaque property forwarding** — libavif forwards unrecognized properties as opaque blobs via `avifImage::properties`. heif-parse drops them as `Unsupported`. Low impact but improves extensibility for callers who want to inspect unknown boxes.
 
 ### P3 — Blocked on spec or test files
 
 - [ ] **reve** — Reference Viewing Environment (v0). No spec available (ISO 23008-12:2025 Amd 1), no implementations exist. libavif stores as opaque blob.
 - [ ] **ndwt** — Nominal Diffuse White Luminance (v0). No spec available, no implementations exist. libavif stores as opaque blob.
 - [ ] **sato** — Sample Transform Derived Image Item (new in 1.2, enables >12bpc via expression-based pixel reconstruction). libavif has full implementation but disabled it by default. No test files in the wild. Large effort.
-- [ ] **ster** — Stereo pair groups. Neither zenavif-parse nor libavif actually processes this. No test files.
+- [ ] **ster** — Stereo pair groups. Neither heif-parse nor libavif actually processes this. No test files.
 
 ### P4 — Edge cases
 
@@ -110,7 +110,7 @@ and libavif (AOMediaCodec/libavif) as of 2026-02-13.
 
 ### What decoders handle vs what the parser exposes
 
-The parser (zenavif-parse) should parse and expose all container-level properties.
+The parser (heif-parse) should parse and expose all container-level properties.
 The decoder (zenavif) is responsible for:
 - Using colr nclx as authoritative color info (may override AV1 bitstream values)
 - Applying irot/imir/clap transforms to the decoded pixels
@@ -118,7 +118,7 @@ The decoder (zenavif) is responsible for:
 - Passing HDR metadata through to the caller for tone mapping
 - Reconstructing HDR from gain map metadata + gain map image + base SDR
 
-### Where zenavif-parse exceeds libavif
+### Where heif-parse exceeds libavif
 
 - mdcv, cclv, amve parsed into typed structs (libavif stores as opaque blobs in standard ipco path)
 - Zero-copy API with `Cow<[u8]>` (libavif always copies)

@@ -1,6 +1,6 @@
 //! Inspect grid AVIF structure
 #![allow(deprecated)]
-use zenavif_parse::read_avif;
+use heif_parse::read_avif;
 use std::env;
 use std::fs::File;
 

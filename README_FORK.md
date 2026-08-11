@@ -1,4 +1,4 @@
-# zenavif-parse Fork
+# heif-parse Fork
 
 This fork extends [kornelski/avif-parse](https://github.com/kornelski/avif-parse) with full AVIF 1.2 feature support for the [zenavif](https://github.com/imazen/zenavif) decoder.
 
@@ -13,7 +13,7 @@ Upstream merge base: v2.0.0. All upstream tests pass. All files in the AOM test 
 Reads the entire file and copies all mdat data into memory. Requires the `eager` feature flag.
 
 ```rust
-use zenavif_parse::read_avif;
+use heif_parse::read_avif;
 use std::io::BufReader;
 use std::fs::File;
 
@@ -27,7 +27,7 @@ av1_decode(&data.primary_item)?;
 Parses metadata without copying pixel data. Returns `Cow<[u8]>` — borrowed for single-extent items, owned (concatenated) for multi-extent items.
 
 ```rust
-use zenavif_parse::{AvifParser, DecodeConfig};
+use heif_parse::{AvifParser, DecodeConfig};
 use enough::Unstoppable;
 
 let bytes = std::fs::read("image.avif")?;
@@ -80,7 +80,7 @@ if let Some(meta) = parser.gain_map_metadata() {
 ### Resource Limits and Cancellation
 
 ```rust
-use zenavif_parse::{AvifParser, DecodeConfig};
+use heif_parse::{AvifParser, DecodeConfig};
 
 let config = DecodeConfig::default()
     .with_peak_memory_limit(64 * 1024 * 1024)

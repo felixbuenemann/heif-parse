@@ -1,4 +1,4 @@
-# zenavif-parse public API — additions from non-default features
+# heif-parse public API — additions from non-default features
 # features: c_api,eager,zencodec
 # (regenerated on every `cargo test` by zenutils-apidoc; ZEN_API_DOC=check verifies, =off skips).
 # Encodings: crate-name prefix stripped; auto traits collapse to a
