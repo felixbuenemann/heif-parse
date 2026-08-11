@@ -1896,7 +1896,7 @@ impl<'data> AvifParser<'data> {
                 BoxType::MovieBox => {
                     let tracks = read_moov(&mut b, stop)?;
                     if !tracks.is_empty() {
-                        animation_data = Some(associate_tracks(tracks)?);
+                        animation_data = associate_tracks(tracks)?;
                     }
                 }
                 BoxType::MediaDataBox => {
@@ -2004,7 +2004,58 @@ impl<'data> AvifParser<'data> {
         };
 
         // Get primary item extents
-        let primary = Self::get_item_extents(&meta, meta.primary_item_id)?;
+        let is_iden = meta
+            .item_infos
+            .iter()
+            .find(|x| x.item_id == meta.primary_item_id)
+            .is_some_and(|info| info.item_type == b"iden");
+        // An `iden` presents another item under its own properties: an
+        // identity derivation, used to apply a rotation or a crop without
+        // recoding the picture. Its geometry and transforms are its own and
+        // are read from it as for any item; its coded data and codec
+        // configuration belong to the item it points at through `dimg`, and
+        // it has none of either itself.
+        let coded_item_id = if is_iden {
+            // The derivation can be a chain -- one `iden` deriving from
+            // another, which is how a file states a crop and a rotation as
+            // separate steps -- so this walks it rather than taking one hop.
+            // Bounded, and refusing to revisit an item, because a file is
+            // free to describe a cycle and a reader is not free to follow it.
+            const MAX_DERIVATION_DEPTH: usize = 8;
+            let mut current = meta.primary_item_id;
+            let mut seen = TryVec::new();
+            seen.push(current).map_err(|e| at!(Error::from(e)))?;
+            loop {
+                let next = meta
+                    .item_references
+                    .iter()
+                    .find(|reference| {
+                        reference.item_type == b"dimg" && reference.from_item_id == current
+                    })
+                    .map(|reference| reference.to_item_id)
+                    .ok_or_else(|| at!(Error::InvalidData("iden item references no image")))?;
+                if seen.contains(&next) {
+                    return Err(at!(Error::InvalidData("derivation references itself")));
+                }
+                current = next;
+                seen.push(current).map_err(|e| at!(Error::from(e)))?;
+                let derived = meta
+                    .item_infos
+                    .iter()
+                    .find(|info| info.item_id == current)
+                    .is_some_and(|info| info.item_type == b"iden");
+                if !derived {
+                    break;
+                }
+                if seen.len() > MAX_DERIVATION_DEPTH {
+                    return Err(at!(Error::InvalidData("derivation chain too long")));
+                }
+            }
+            current
+        } else {
+            meta.primary_item_id
+        };
+        let primary = Self::get_item_extents(&meta, coded_item_id)?;
 
         // Find alpha item and get its extents
         let alpha_item_id = meta
@@ -4813,7 +4864,10 @@ fn is_supported_brand(brand: &FourCC) -> bool {
 /// `grid` is a derived item rather than a coded one; it earns its place here
 /// because it is a legal primary item, with its tiles referenced from it.
 fn is_image_item_type(item_type: &FourCC) -> bool {
-    matches!(&item_type.value, b"av01" | b"hvc1" | b"hev1" | b"grid")
+    matches!(
+        &item_type.value,
+        b"av01" | b"hvc1" | b"hev1" | b"grid" | b"iden"
+    )
 }
 
 /// Parse a Handler Reference Box
@@ -6383,16 +6437,22 @@ fn read_mdia<T: Read>(
 /// - Color track: first with handler `pict` (fallback: first track with a sample table)
 /// - Alpha track: handler `auxv` with `tref/auxl` referencing color's track_id
 /// - Audio tracks (handler `soun`) are skipped
-fn associate_tracks(tracks: TryVec<ParsedTrack>) -> Result<ParsedAnimationData> {
+fn associate_tracks(tracks: TryVec<ParsedTrack>) -> Result<Option<ParsedAnimationData>> {
     // Find color track: first with handler_type == "pict"
-    let color_idx = tracks
+    let Some(color_idx) = tracks
         .iter()
         .position(|t| t.handler_type == b"pict")
         .or_else(|| {
             // Fallback: first track that isn't audio
             tracks.iter().position(|t| t.handler_type != b"soun")
         })
-        .ok_or_else(|| at!(Error::InvalidData("no color track found in moov")))?;
+    else {
+        // A `moov` holding only audio is a still image with a sound recording
+        // attached, which HEIC allows and phones write. There is no image
+        // sequence here, which is a different statement from a broken file --
+        // and the still in `meta` reads perfectly well.
+        return Ok(None);
+    };
 
     let color_track = tracks.get(color_idx)
         .ok_or_else(|| at!(Error::InvalidData("color track index out of bounds")))?;
@@ -6447,14 +6507,14 @@ fn associate_tracks(tracks: TryVec<ParsedTrack>) -> Result<ParsedAnimationData> 
         None => (None, None),
     };
 
-    Ok(ParsedAnimationData {
+    Ok(Some(ParsedAnimationData {
         color_timescale: color_track.media_timescale,
         color_codec_config: color_track.codec_config,
         color_sample_table: color_track.sample_table,
         alpha_timescale,
         alpha_sample_table,
         loop_count: color_track.loop_count,
-    })
+    }))
 }
 
 /// Parse media information box (minf)

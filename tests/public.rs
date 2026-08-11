@@ -2490,3 +2490,72 @@ fn a_still_has_no_track_geometry() {
     assert!(parser.track_color_info().is_none());
 }
 
+
+// -- Derived items and non-picture tracks --
+
+#[test]
+fn an_audio_track_beside_a_still_is_not_a_missing_picture() {
+    // A `moov` holding only sound is a still image with a recording attached,
+    // which HEIC allows and phones write. Reporting it as a malformed
+    // container refuses a file whose still reads perfectly well.
+    //
+    // Built rather than shipped: the corpus file that prompted this is half a
+    // megabyte and this is a claim about one box. The track carries a sample
+    // table because a track without one is dropped before the code under test
+    // is reached -- which is what made the first version of this pass while
+    // proving nothing.
+    fn boxed(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut out = ((payload.len() + 8) as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(kind);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    let mut full = vec![0u8; 4]; // version + flags
+    full.extend_from_slice(&0u32.to_be_bytes()); // entry_count
+    let stbl = [
+        boxed(b"stsd", &full),
+        boxed(b"stts", &full),
+        boxed(b"stsc", &full),
+        boxed(b"stsz", &{
+            let mut p = vec![0u8; 4];
+            p.extend_from_slice(&0u32.to_be_bytes()); // sample_size
+            p.extend_from_slice(&0u32.to_be_bytes()); // sample_count
+            p
+        }),
+        boxed(b"stco", &full),
+    ]
+    .concat();
+
+    let mut mdhd = vec![0u8; 4]; // version 0 + flags
+    mdhd.extend_from_slice(&0u32.to_be_bytes()); // creation
+    mdhd.extend_from_slice(&0u32.to_be_bytes()); // modification
+    mdhd.extend_from_slice(&1000u32.to_be_bytes()); // timescale
+    mdhd.extend_from_slice(&0u32.to_be_bytes()); // duration
+    mdhd.extend_from_slice(&[0; 4]); // language + pre_defined
+
+    let mut hdlr = vec![0u8; 4];
+    hdlr.extend_from_slice(&[0; 4]);
+    hdlr.extend_from_slice(b"soun");
+    hdlr.extend_from_slice(&[0; 12]);
+    hdlr.push(0);
+
+    let mdia = [
+        boxed(b"mdhd", &mdhd),
+        boxed(b"hdlr", &hdlr),
+        boxed(b"minf", &boxed(b"stbl", &stbl)),
+    ]
+    .concat();
+    let moov = boxed(b"trak", &boxed(b"mdia", &mdia));
+
+    let mut file = std::fs::read(IMAGE_AVIF).expect("read file");
+    file.extend_from_slice(&boxed(b"moov", &moov));
+
+    let parser = zenavif_parse::AvifParser::from_bytes(&file)
+        .expect("a still with a sound track still describes its still");
+    assert!(
+        parser.animation_info().is_none(),
+        "a sound track is not an image sequence"
+    );
+    assert!(parser.spatial_extents().is_some(), "the still is still there");
+}
