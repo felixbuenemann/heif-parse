@@ -161,6 +161,8 @@ box_database!(
     OperatingPointSelectorBox         0x6131_6f70, // "a1op"
     LayerSelectorBox                  0x6c73_656c, // "lsel"
     AV1LayeredImageIndexingBox        0x6131_6c78, // "a1lx"
+    ComponentDefinitionBox            0x636d_7064, // "cmpd" - ISO/IEC 23001-17
+    UncompressedFrameConfigBox        0x756e_6343, // "uncC" - ISO/IEC 23001-17
     FLACSampleEntry                   0x664c_6143, // "fLaC"
     FLACSpecificBox                   0x6466_4c61, // "dfLa"
     OpusSampleEntry                   0x4f70_7573, // "Opus"

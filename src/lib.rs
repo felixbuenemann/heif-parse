@@ -1054,6 +1054,140 @@ pub struct AV1LayeredImageIndexing {
     pub layer_sizes: [u32; 3],
 }
 
+/// One entry of a `cmpd` component definition (ISO/IEC 23001-17).
+///
+/// Says what a component MEANS -- red, luma, alpha, depth -- without saying
+/// how it is stored. The `uncC` box that sits beside it says the how, and
+/// refers back to entries here by index, so neither box is usable alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DefinedComponent {
+    /// 0 monochrome, 1..=3 red/green/blue, 4 alpha, 5 depth, 7..=9 Y/Cb/Cr,
+    /// and so on through Table 1 of the specification. Values from 0x8000 are
+    /// defined by a URI instead, which this does not carry.
+    pub component_type: u16,
+}
+
+impl TryClone for DefinedComponent {
+    fn try_clone(&self) -> Result<Self, TryReserveError> {
+        Ok(*self)
+    }
+}
+
+/// The `cmpd` box: what the components of an uncompressed item are.
+#[derive(Debug, Default, PartialEq)]
+pub struct ComponentDefinition {
+    components: TryVec<DefinedComponent>,
+}
+
+impl ComponentDefinition {
+    /// The components, in the order `uncC` indexes them.
+    #[must_use]
+    pub fn components(&self) -> &[DefinedComponent] {
+        &self.components
+    }
+}
+
+impl TryClone for ComponentDefinition {
+    fn try_clone(&self) -> Result<Self, TryReserveError> {
+        Ok(Self { components: self.components.try_clone()? })
+    }
+}
+
+/// How one component of an uncompressed item is stored (ISO/IEC 23001-17).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UncompressedComponent {
+    /// Which `cmpd` entry this describes.
+    pub index: u16,
+    /// Bits per sample, 1..=256. Stored on the wire as one less.
+    pub bit_depth: u16,
+    /// 0 unsigned integer, 1 signed integer, 2 float, 3 complex.
+    pub format: u8,
+    /// Bytes each sample is padded up to, or 0 for no padding.
+    pub align_size: u8,
+}
+
+impl TryClone for UncompressedComponent {
+    fn try_clone(&self) -> Result<Self, TryReserveError> {
+        Ok(*self)
+    }
+}
+
+/// The `uncC` box: how an uncompressed item's samples are laid out.
+///
+/// Everything a reader needs to walk the bytes -- which components in what
+/// order, how they interleave, how rows and tiles align, which end of a
+/// sample the padding sits on.
+///
+/// Version 1 is the MINIMIZED form: a single four-character profile stands
+/// for the whole description and no components are listed. The profile is
+/// carried here either way, so a reader can expand it rather than guess.
+#[derive(Debug, Default, PartialEq)]
+pub struct UncompressedFrameConfig {
+    /// The four-character profile, or all zero where none is stated.
+    pub profile: [u8; 4],
+    /// Empty in the minimized form, where `profile` stands for the layout.
+    components: TryVec<UncompressedComponent>,
+    /// 0 none, 1 4:2:2, 2 4:2:0, 3 4:1:1.
+    pub sampling_type: u8,
+    /// 0 component (planar), 1 pixel, 2 mixed, 3 row, 4 tile, 5 multi-Y.
+    pub interleave_type: u8,
+    /// Bytes per block, or 0 where components are not packed into blocks.
+    pub block_size: u8,
+    /// Samples are stored little-endian.
+    pub components_little_endian: bool,
+    /// Block padding sits in the least significant bits.
+    pub block_pad_lsb: bool,
+    /// Blocks are stored little-endian.
+    pub block_little_endian: bool,
+    /// Components run from the end of the block towards its start.
+    pub block_reversed: bool,
+    /// Padding bits carry no defined value.
+    pub pad_unknown: bool,
+    /// Bytes per pixel where pixel-interleaved and padded, else 0.
+    pub pixel_size: u32,
+    /// Bytes each row is padded up to, or 0.
+    pub row_align_size: u32,
+    /// Bytes each tile is padded up to, or 0.
+    pub tile_align_size: u32,
+    /// Tile columns. Stored on the wire as one less; never zero here.
+    pub num_tile_cols: u32,
+    /// Tile rows. Stored on the wire as one less; never zero here.
+    pub num_tile_rows: u32,
+}
+
+impl UncompressedFrameConfig {
+    /// The components, indexing into the `cmpd` box's list.
+    ///
+    /// Empty for a version 1 box, where [`Self::profile`] stands for the
+    /// whole layout.
+    #[must_use]
+    pub fn components(&self) -> &[UncompressedComponent] {
+        &self.components
+    }
+}
+
+impl TryClone for UncompressedFrameConfig {
+    fn try_clone(&self) -> Result<Self, TryReserveError> {
+        Ok(Self {
+            profile: self.profile,
+            components: self.components.try_clone()?,
+            sampling_type: self.sampling_type,
+            interleave_type: self.interleave_type,
+            block_size: self.block_size,
+            components_little_endian: self.components_little_endian,
+            block_pad_lsb: self.block_pad_lsb,
+            block_little_endian: self.block_little_endian,
+            block_reversed: self.block_reversed,
+            pad_unknown: self.pad_unknown,
+            pixel_size: self.pixel_size,
+            row_align_size: self.row_align_size,
+            tile_align_size: self.tile_align_size,
+            num_tile_cols: self.num_tile_cols,
+            num_tile_rows: self.num_tile_rows,
+        })
+    }
+}
+
 /// Options for parsing AVIF files
 ///
 /// Prefer using [`DecodeConfig::lenient()`] with [`AvifParser`] instead.
@@ -1733,6 +1867,8 @@ pub struct AvifParser<'data> {
     av1_config: Option<AV1Config>,
     hevc_config: Option<HEVCConfig>,
     alpha_hevc_config: Option<HEVCConfig>,
+    component_definition: Option<ComponentDefinition>,
+    uncompressed_config: Option<UncompressedFrameConfig>,
     color_info: Option<ColorInformation>,
     icc_color_info: Option<ColorInformation>,
     pixel_information: Option<TryVec<u8>>,
@@ -2016,6 +2152,8 @@ impl<'data> AvifParser<'data> {
                 // A file that is only a track has no auxiliary ITEM; its
                 // alpha, where it has any, is a second track.
                 alpha_hevc_config: None,
+                component_definition: None,
+                uncompressed_config: None,
                 color_info: track_config.color_info,
                 // A sample entry carries one `colr`, so there is no second
                 // one to report for a file that is only a track.
@@ -2430,6 +2568,28 @@ impl<'data> AvifParser<'data> {
             .map(TryClone::try_clone)
             .transpose()
             .map_err(|e| at!(Error::from(e)))?;
+        // The two halves of an ISO/IEC 23001-17 description. Neither is
+        // usable without the other -- `uncC` says how the samples are laid
+        // out and refers to `cmpd` entries by index for what they mean -- so
+        // they are read together and offered together.
+        let mut component_definition = None;
+        let mut uncompressed_config = None;
+        for property in &meta.properties {
+            if property.item_id != meta.primary_item_id {
+                continue;
+            }
+            match &property.property {
+                ItemProperty::ComponentDefinition(definition) if component_definition.is_none() => {
+                    component_definition =
+                        Some(definition.try_clone().map_err(|e| at!(Error::from(e)))?);
+                }
+                ItemProperty::UncompressedFrameConfig(config) if uncompressed_config.is_none() => {
+                    uncompressed_config =
+                        Some(config.try_clone().map_err(|e| at!(Error::from(e)))?);
+                }
+                _ => {}
+            }
+        }
         // An item may carry two `colr` boxes -- an `nclx` and a restricted
         // ICC profile -- which MIAF allows and which describe the same image
         // to two kinds of reader. Taking the first in `ipco` order silently
@@ -2513,6 +2673,8 @@ impl<'data> AvifParser<'data> {
             av1_config,
             hevc_config,
             alpha_hevc_config,
+            component_definition,
+            uncompressed_config,
             color_info,
             icc_color_info,
             pixel_information: meta.properties.iter().find_map(|p| {
@@ -3097,6 +3259,25 @@ impl<'data> AvifParser<'data> {
     #[must_use]
     pub fn alpha_hevc_config(&self) -> Option<&HEVCConfig> {
         self.alpha_hevc_config.as_ref()
+    }
+
+    /// What the primary item's components MEAN, for an uncompressed item.
+    ///
+    /// The `cmpd` half of an ISO/IEC 23001-17 description: red, luma, alpha
+    /// and so on, in the order [`Self::uncompressed_config`] indexes them.
+    /// Neither box is usable without the other.
+    #[must_use]
+    pub fn component_definition(&self) -> Option<&ComponentDefinition> {
+        self.component_definition.as_ref()
+    }
+
+    /// How the primary item's samples are laid out, for an uncompressed item.
+    ///
+    /// The `uncC` half. Its presence is what makes an item uncompressed:
+    /// there is no codec configuration to find, because there is no codec.
+    #[must_use]
+    pub fn uncompressed_config(&self) -> Option<&UncompressedFrameConfig> {
+        self.uncompressed_config.as_ref()
     }
 
     /// The HEVC configuration from the track's sample entry, if there is one.
@@ -5008,7 +5189,14 @@ fn is_supported_brand(brand: &FourCC) -> bool {
 fn is_image_item_type(item_type: &FourCC) -> bool {
     matches!(
         &item_type.value,
+        // Coded pictures, and the two derivations that stand for one.
         b"av01" | b"hvc1" | b"hev1" | b"grid" | b"iden"
+        // ISO/IEC 23001-17: a picture stored as samples rather than coded,
+        // and the same wrapped in a general-purpose compressor. Both are
+        // image items -- they carry `ispe` and are what `pitm` points at --
+        // and refusing them here rejected the file before anything could
+        // read the `uncC` that describes them.
+        | b"unci" | b"icmp"
     )
 }
 
@@ -5258,6 +5446,8 @@ pub(crate) enum ItemProperty {
     OperatingPointSelector(OperatingPointSelector),
     LayerSelector(LayerSelector),
     AV1LayeredImageIndexing(AV1LayeredImageIndexing),
+    ComponentDefinition(ComponentDefinition),
+    UncompressedFrameConfig(UncompressedFrameConfig),
     Unsupported,
 }
 
@@ -5282,6 +5472,8 @@ impl TryClone for ItemProperty {
             Self::OperatingPointSelector(val) => Self::OperatingPointSelector(*val),
             Self::LayerSelector(val) => Self::LayerSelector(*val),
             Self::AV1LayeredImageIndexing(val) => Self::AV1LayeredImageIndexing(*val),
+            Self::ComponentDefinition(val) => Self::ComponentDefinition(val.try_clone()?),
+            Self::UncompressedFrameConfig(val) => Self::UncompressedFrameConfig(val.try_clone()?),
             Self::Unsupported => Self::Unsupported,
         })
     }
@@ -5466,6 +5658,8 @@ fn read_ipco<T: Read>(src: &mut BMFFBox<'_, T>, options: &ParseOptions) -> Resul
             BoxType::OperatingPointSelectorBox => ItemProperty::OperatingPointSelector(read_a1op(&mut b)?),
             BoxType::LayerSelectorBox => ItemProperty::LayerSelector(read_lsel(&mut b)?),
             BoxType::AV1LayeredImageIndexingBox => ItemProperty::AV1LayeredImageIndexing(read_a1lx(&mut b)?),
+            BoxType::ComponentDefinitionBox => ItemProperty::ComponentDefinition(read_cmpd(&mut b, options)?),
+            BoxType::UncompressedFrameConfigBox => ItemProperty::UncompressedFrameConfig(read_uncc(&mut b, options)?),
             _ => {
                 skip_box_remain(&mut b)?;
                 ItemProperty::Unsupported
@@ -5474,6 +5668,122 @@ fn read_ipco<T: Read>(src: &mut BMFFBox<'_, T>, options: &ParseOptions) -> Resul
         properties.push(IndexedProperty { fourcc, property: prop }).map_err(|e| at!(Error::from(e)))?;
     }
     Ok(properties)
+}
+
+/// Read a `cmpd` component definition box (ISO/IEC 23001-17 section 5.2.2).
+///
+/// Not a full box: the component count is the first field, with no version or
+/// flags ahead of it.
+fn read_cmpd<T: Read>(src: &mut BMFFBox<'_, T>, options: &ParseOptions) -> Result<ComponentDefinition> {
+    let component_count = be_u32(src)?;
+    // The count is read from the file, so a corrupt one would otherwise ask
+    // for as many allocations as it names before the reads start failing.
+    // Bounded by what is left rather than by a constant: every entry is at
+    // least two bytes, so the box cannot hold more than half its remainder.
+    let bound = src.bytes_left() / 2;
+    if u64::from(component_count) > bound {
+        return Err(at!(Error::InvalidData("cmpd component count exceeds box")));
+    }
+    let mut components = TryVec::new();
+    for _ in 0..component_count {
+        let component_type = be_u16(src)?;
+        // Types from 0x8000 name themselves with a URI rather than by number.
+        // It is not carried, but it has to be CONSUMED, or every component
+        // after it is read from the middle of a string.
+        if component_type >= 0x8000 {
+            loop {
+                if src.bytes_left() == 0 {
+                    return Err(at!(Error::InvalidData("cmpd component URI is unterminated")));
+                }
+                if src.read_u8().map_err(|e| at!(Error::from(e)))? == 0 {
+                    break;
+                }
+            }
+        }
+        components
+            .push(DefinedComponent { component_type })
+            .map_err(|e| at!(Error::from(e)))?;
+    }
+    if options.lenient {
+        skip_box_remain(src)?;
+    }
+    Ok(ComponentDefinition { components })
+}
+
+/// Read a `uncC` uncompressed frame configuration box (ISO/IEC 23001-17
+/// section 5.2.1).
+///
+/// Version 1 is the minimized form: the profile alone, standing for a layout
+/// the specification tabulates. It is returned as such rather than expanded
+/// here, because expanding it is a decoder's business and this box is only
+/// what the file says.
+fn read_uncc<T: Read>(src: &mut BMFFBox<'_, T>, options: &ParseOptions) -> Result<UncompressedFrameConfig> {
+    let version = read_fullbox_version_no_flags(src, options)?;
+    let mut config = UncompressedFrameConfig {
+        // A minimized box states no tiling, and the general form stores its
+        // counts as one less. Either way neither is ever zero, so the
+        // defaults are the identity rather than the wire's encoding of it.
+        num_tile_cols: 1,
+        num_tile_rows: 1,
+        ..Default::default()
+    };
+    config.profile = be_u32(src)?.to_be_bytes();
+    if version == 1 {
+        // Nothing else is present. The profile is the description.
+        skip_box_remain(src)?;
+        return Ok(config);
+    }
+    if version != 0 {
+        return Err(at!(Error::Unsupported("uncC version")));
+    }
+
+    let component_count = be_u32(src)?;
+    // Five bytes each, so the box bounds the count the same way `cmpd` does.
+    if u64::from(component_count) > src.bytes_left() / 5 {
+        return Err(at!(Error::InvalidData("uncC component count exceeds box")));
+    }
+    for _ in 0..component_count {
+        let index = be_u16(src)?;
+        // Stored as one less, so the range is 1..=256 and never zero.
+        let bit_depth = u16::from(src.read_u8().map_err(|e| at!(Error::from(e)))?) + 1;
+        let format = src.read_u8().map_err(|e| at!(Error::from(e)))?;
+        let align_size = src.read_u8().map_err(|e| at!(Error::from(e)))?;
+        // A component padded to fewer bytes than its samples need describes
+        // nothing a reader can walk: the pad width is the alignment minus the
+        // depth, and here that is negative.
+        if align_size != 0 && u32::from(align_size) * 8 < u32::from(bit_depth) {
+            return Err(at!(Error::InvalidData("uncC component alignment is below its bit depth")));
+        }
+        config
+            .components
+            .push(UncompressedComponent { index, bit_depth, format, align_size })
+            .map_err(|e| at!(Error::from(e)))?;
+    }
+
+    config.sampling_type = src.read_u8().map_err(|e| at!(Error::from(e)))?;
+    config.interleave_type = src.read_u8().map_err(|e| at!(Error::from(e)))?;
+    config.block_size = src.read_u8().map_err(|e| at!(Error::from(e)))?;
+    let flags = src.read_u8().map_err(|e| at!(Error::from(e)))?;
+    config.components_little_endian = flags & 0x80 != 0;
+    config.block_pad_lsb = flags & 0x40 != 0;
+    config.block_little_endian = flags & 0x20 != 0;
+    config.block_reversed = flags & 0x10 != 0;
+    config.pad_unknown = flags & 0x08 != 0;
+    config.pixel_size = be_u32(src)?;
+    config.row_align_size = be_u32(src)?;
+    config.tile_align_size = be_u32(src)?;
+    // Stored as one less. 0xFFFFFFFF would mean 2^32 tiles, which does not
+    // fit the count it is being turned into -- and wrapping it would make the
+    // count zero, which every division by it would then fault on.
+    let cols_minus_one = be_u32(src)?;
+    let rows_minus_one = be_u32(src)?;
+    if cols_minus_one == u32::MAX || rows_minus_one == u32::MAX {
+        return Err(at!(Error::Unsupported("uncC states 2^32 tiles")));
+    }
+    config.num_tile_cols = cols_minus_one + 1;
+    config.num_tile_rows = rows_minus_one + 1;
+    skip_box_remain(src)?;
+    Ok(config)
 }
 
 fn read_pixi<T: Read>(src: &mut BMFFBox<'_, T>, options: &ParseOptions) -> Result<ArrayVec<u8, 16>> {
