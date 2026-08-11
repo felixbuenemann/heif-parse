@@ -1724,7 +1724,7 @@ pub struct AvifParser<'data> {
     grid_config: Option<GridConfig>,
     grid_tile_extents: Option<ImageSpatialExtents>,
     tiles: TryVec<ItemExtents>,
-    thumbnails: TryVec<(ThumbnailInfo, ItemExtents)>,
+    thumbnails: TryVec<(ThumbnailInfo, ItemExtents, Option<HEVCConfig>)>,
     animation_data: Option<AnimationParserData>,
     premultiplied_alpha: bool,
     primary_item_id: u32,
@@ -2192,7 +2192,8 @@ impl<'data> AvifParser<'data> {
 
         // Thumbnails reference the image they stand in for, so the reference
         // runs from the thumbnail to the primary item, not the other way.
-        let mut thumbnails: TryVec<(ThumbnailInfo, ItemExtents)> = TryVec::new();
+        let mut thumbnails: TryVec<(ThumbnailInfo, ItemExtents, Option<HEVCConfig>)> =
+            TryVec::new();
         for iref in meta.item_references.iter() {
             if iref.to_item_id != meta.primary_item_id || iref.item_type != b"thmb" {
                 continue;
@@ -2219,8 +2220,23 @@ impl<'data> AvifParser<'data> {
                     _ => None,
                 });
             let extents = Self::get_item_extents(&meta, item_id)?;
+            // The thumbnail's own `hvcC`, read here because the properties are
+            // only in scope during the parse. A thumbnail is a separately
+            // coded picture: its parameter sets describe a picture of the
+            // thumbnail's size, and the primary's describe one of the
+            // primary's. Decoding the small item against the large record does
+            // not fail cleanly -- it is the same defect the alpha auxiliary
+            // had, and the reason `alpha_hevc_config` exists.
+            let hevc_config = hevc_config_for(&meta.properties, item_id)
+                .map(TryClone::try_clone)
+                .transpose()
+                .map_err(|e| at!(Error::from(e)))?;
             thumbnails
-                .push((ThumbnailInfo { item_id, width, height, clean_aperture }, extents))
+                .push((
+                    ThumbnailInfo { item_id, width, height, clean_aperture },
+                    extents,
+                    hevc_config,
+                ))
                 .map_err(|e| at!(Error::from(e)))?;
         }
 
@@ -2925,7 +2941,7 @@ impl<'data> AvifParser<'data> {
     /// small rendition can decode one of these rather than the full image.
     #[must_use]
     pub fn thumbnails(&self) -> impl Iterator<Item = ThumbnailInfo> + '_ {
-        self.thumbnails.iter().map(|(info, _)| *info)
+        self.thumbnails.iter().map(|(info, _, _)| *info)
     }
 
     /// How many thumbnail items reference the primary image.
@@ -2936,9 +2952,24 @@ impl<'data> AvifParser<'data> {
 
     /// Coded bytes of one thumbnail, indexed as [`Self::thumbnails`] yields them.
     pub fn thumbnail_data(&self, index: usize) -> Result<Cow<'_, [u8]>> {
-        let (_, item) = self.thumbnails.get(index)
+        let (_, item, _) = self.thumbnails.get(index)
             .ok_or_else(|| at!(Error::InvalidData("thumbnail index out of bounds")))?;
         self.resolve_item(item)
+    }
+
+    /// HEVC configuration for one thumbnail, if it carries its own.
+    ///
+    /// Indexed as [`Self::thumbnails`] yields them. Distinct from
+    /// [`Self::hevc_config`] for the reason [`Self::alpha_hevc_config`] is:
+    /// the thumbnail is a separately coded picture and its parameter sets
+    /// describe its own dimensions, not the primary's.
+    ///
+    /// No fallback to the primary's, deliberately. A caller that wants one
+    /// should write it, so that a file where the two genuinely differ cannot
+    /// be silently decoded against the wrong record.
+    #[must_use]
+    pub fn thumbnail_hevc_config(&self, index: usize) -> Option<&HEVCConfig> {
+        self.thumbnails.get(index).and_then(|(_, _, config)| config.as_ref())
     }
 
     /// Get a single animation frame by index.
