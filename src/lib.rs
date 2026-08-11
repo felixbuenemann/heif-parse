@@ -1706,6 +1706,7 @@ pub struct AvifParser<'data> {
     av1_config: Option<AV1Config>,
     hevc_config: Option<HEVCConfig>,
     color_info: Option<ColorInformation>,
+    icc_color_info: Option<ColorInformation>,
     rotation: Option<ImageRotation>,
     mirror: Option<ImageMirror>,
     clean_aperture: Option<CleanAperture>,
@@ -1953,6 +1954,9 @@ impl<'data> AvifParser<'data> {
                 av1_config: track_config.av1_config,
                 hevc_config: track_config.hevc_config,
                 color_info: track_config.color_info,
+                // A sample entry carries one `colr`, so there is no second
+                // one to report for a file that is only a track.
+                icc_color_info: None,
                 rotation: None,
                 mirror: None,
                 clean_aperture: None,
@@ -2317,7 +2321,30 @@ impl<'data> AvifParser<'data> {
             .map(TryClone::try_clone)
             .transpose()
             .map_err(|e| at!(Error::from(e)))?;
-        let color_info = find_prop!(ColorInformation)
+        // An item may carry two `colr` boxes -- an `nclx` and a restricted
+        // ICC profile -- which MIAF allows and which describe the same image
+        // to two kinds of reader. Taking the first in `ipco` order silently
+        // discarded the other and made the answer depend on write order.
+        let mut color_info = None;
+        let mut icc_color_info = None;
+        for property in &meta.properties {
+            if property.item_id != meta.primary_item_id {
+                continue;
+            }
+            if let ItemProperty::ColorInformation(info) = &property.property {
+                match info {
+                    ColorInformation::IccProfile(_) if icc_color_info.is_none() => {
+                        icc_color_info = Some(info.clone());
+                    }
+                    ColorInformation::Nclx { .. } if color_info.is_none() => {
+                        color_info = Some(info.clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let color_info = color_info
+            .or_else(|| icc_color_info.clone())
             .or_else(|| track_config.and_then(|c| c.color_info.clone()));
         let rotation = find_prop!(Rotation);
         let mirror = find_prop!(Mirror);
@@ -2355,6 +2382,7 @@ impl<'data> AvifParser<'data> {
             av1_config,
             hevc_config,
             color_info,
+            icc_color_info,
             rotation,
             mirror,
             clean_aperture,
@@ -2899,6 +2927,18 @@ impl<'data> AvifParser<'data> {
     /// differ from values in the AV1 bitstream sequence header.
     pub fn color_info(&self) -> Option<&ColorInformation> {
         self.color_info.as_ref()
+    }
+
+    /// The item's restricted ICC profile, when it carries one alongside an
+    /// `nclx`.
+    ///
+    /// MIAF permits both `colr` boxes on one item: the profile for readers
+    /// that apply one, the code points for readers that do not. They are not
+    /// alternatives, so [`Self::color_info`] -- which can hold only one --
+    /// cannot report both, and prefers the `nclx` when a file states both.
+    #[must_use]
+    pub fn icc_color_info(&self) -> Option<&ColorInformation> {
+        self.icc_color_info.as_ref()
     }
 
     /// Get rotation for the primary item, if present.

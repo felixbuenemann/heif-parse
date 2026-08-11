@@ -2489,3 +2489,4 @@ fn a_still_has_no_track_geometry() {
     assert!(parser.track_spatial_extents().is_none());
     assert!(parser.track_color_info().is_none());
 }
+
