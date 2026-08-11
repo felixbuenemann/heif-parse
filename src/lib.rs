@@ -1713,6 +1713,7 @@ pub struct AvifParser<'data> {
     spatial_extents: Option<ImageSpatialExtents>,
     av1_config: Option<AV1Config>,
     hevc_config: Option<HEVCConfig>,
+    alpha_hevc_config: Option<HEVCConfig>,
     color_info: Option<ColorInformation>,
     icc_color_info: Option<ColorInformation>,
     pixel_information: Option<TryVec<u8>>,
@@ -1990,6 +1991,9 @@ impl<'data> AvifParser<'data> {
                 spatial_extents: None,
                 av1_config: track_config.av1_config,
                 hevc_config: track_config.hevc_config,
+                // A file that is only a track has no auxiliary ITEM; its
+                // alpha, where it has any, is a second track.
+                alpha_hevc_config: None,
                 color_info: track_config.color_info,
                 // A sample entry carries one `colr`, so there is no second
                 // one to report for a file that is only a track.
@@ -2401,13 +2405,7 @@ impl<'data> AvifParser<'data> {
         // HEVCConfig owns its parameter sets, so it try_clones rather than
         // clones and cannot ride the macro above. The track's sample entry is
         // the same fallback av1_config uses.
-        let hevc_config = meta
-            .properties
-            .iter()
-            .find_map(|p| match (&p.property, p.item_id == meta.primary_item_id) {
-                (ItemProperty::HEVCConfig(c), true) => Some(c),
-                _ => None,
-            })
+        let hevc_config = hevc_config_for(&meta.properties, meta.primary_item_id)
             .or_else(|| track_config.and_then(|c| c.hevc_config.as_ref()))
             // A `grid` carries no codec configuration of its own; the property
             // sits on the tiles. HEVC cannot recover it from the coded data
@@ -2421,6 +2419,15 @@ impl<'data> AvifParser<'data> {
                     _ => None,
                 })
             })
+            .map(TryClone::try_clone)
+            .transpose()
+            .map_err(|e| at!(Error::from(e)))?;
+        // The auxiliary's own record, where it has one. No fallback: the
+        // caller is meant to fall back to `hevc_config` deliberately, and
+        // silently substituting the primary's here would hide the very
+        // mismatch this exists to expose.
+        let alpha_hevc_config = alpha_item_id
+            .and_then(|id| hevc_config_for(&meta.properties, id))
             .map(TryClone::try_clone)
             .transpose()
             .map_err(|e| at!(Error::from(e)))?;
@@ -2504,6 +2511,7 @@ impl<'data> AvifParser<'data> {
             spatial_extents,
             av1_config,
             hevc_config,
+            alpha_hevc_config,
             color_info,
             icc_color_info,
             pixel_information: meta.properties.iter().find_map(|p| {
@@ -3021,6 +3029,28 @@ impl<'data> AvifParser<'data> {
     #[must_use]
     pub fn hevc_config(&self) -> Option<&HEVCConfig> {
         self.hevc_config.as_ref()
+    }
+
+    /// HEVC configuration for the ALPHA auxiliary item, if it has its own.
+    ///
+    /// Distinct from [`Self::hevc_config`] for the same reason
+    /// [`Self::track_hevc_config`] is: the auxiliary is a separately coded
+    /// picture and its parameter sets need not match the primary's. Usually
+    /// they do not — an alpha plane is monochrome, so its SPS says
+    /// `chroma_format_idc = 0` where the picture's says 4:2:0.
+    ///
+    /// Decoding the auxiliary against the primary's record does not fail
+    /// cleanly. The decoder reads the alpha bitstream believing it to be
+    /// colour and hands back a three-plane frame whose luma is not the
+    /// coverage, which reads downstream as transparency that is merely wrong
+    /// rather than absent.
+    ///
+    /// `None` where the auxiliary carries no record of its own, in which case
+    /// the primary's is the only one on offer and the writer presumably meant
+    /// it to serve both.
+    #[must_use]
+    pub fn alpha_hevc_config(&self) -> Option<&HEVCConfig> {
+        self.alpha_hevc_config.as_ref()
     }
 
     /// The HEVC configuration from the track's sample entry, if there is one.
@@ -5220,6 +5250,21 @@ struct Association {
 pub(crate) struct AssociatedProperty {
     pub item_id: u32,
     pub property: ItemProperty,
+}
+
+/// The `hvcC` associated with one item, if the file gives that item one.
+///
+/// Selection is by item id and nothing else. Items in a HEIF each carry their
+/// own decoder configuration, and a picture and its alpha auxiliary routinely
+/// hold different ones — the auxiliary is monochrome, so its SPS says
+/// `chroma_format_idc = 0` where the picture's says 4:2:0. Reading one item's
+/// stream against another's record does not fail cleanly; it decodes to a
+/// picture of the wrong shape.
+fn hevc_config_for(properties: &[AssociatedProperty], item_id: u32) -> Option<&HEVCConfig> {
+    properties.iter().find_map(|p| match &p.property {
+        ItemProperty::HEVCConfig(config) if p.item_id == item_id => Some(config),
+        _ => None,
+    })
 }
 
 fn read_ipma<T: Read>(src: &mut BMFFBox<'_, T>) -> Result<TryVec<Association>> {
@@ -7433,6 +7478,44 @@ mod sample_offset_overflow_tests {
             Err(Error::InvalidData(msg)) => assert_eq!(msg, "sample offset overflow"),
             other => panic!("expected InvalidData(sample offset overflow), got {:?}", other),
         }
+    }
+
+    /// A picture and its alpha auxiliary each get their OWN `hvcC`.
+    ///
+    /// The two records differ in the ordinary case: an alpha plane is
+    /// monochrome, so its `chroma_format_idc` is 0 where the picture's is 1.
+    /// Selecting by anything but the item id hands one item's stream to the
+    /// other's decoder configuration, which decodes to a picture of the wrong
+    /// shape rather than failing.
+    #[test]
+    fn hevc_config_is_selected_by_item_id() {
+        fn config(chroma_format_idc: u8) -> HEVCConfig {
+            HEVCConfig {
+                general_profile_space: 0,
+                general_tier_flag: false,
+                general_profile_idc: 1,
+                general_level_idc: 60,
+                chroma_format_idc,
+                bit_depth_luma: 8,
+                bit_depth_chroma: 8,
+                nal_length_size: 4,
+                parameter_sets: TryVec::new(),
+            }
+        }
+
+        let mut properties = TryVec::new();
+        properties
+            .push(AssociatedProperty { item_id: 1, property: ItemProperty::HEVCConfig(config(1)) })
+            .unwrap();
+        properties
+            .push(AssociatedProperty { item_id: 2, property: ItemProperty::HEVCConfig(config(0)) })
+            .unwrap();
+
+        assert_eq!(hevc_config_for(&properties, 1).map(HEVCConfig::monochrome), Some(false));
+        assert_eq!(hevc_config_for(&properties, 2).map(HEVCConfig::monochrome), Some(true));
+        // An item the file associates no record with gets none, rather than
+        // the first one that happens to be present.
+        assert!(hevc_config_for(&properties, 3).is_none());
     }
 
     /// Sanity: a non-malicious table still computes offsets correctly.
