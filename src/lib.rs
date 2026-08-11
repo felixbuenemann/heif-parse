@@ -1947,6 +1947,9 @@ pub struct AvifParser<'data> {
     xmp_item: Option<ItemExtents>,
     gain_map_metadata: Option<GainMapMetadata>,
     gain_map: Option<ItemExtents>,
+    gain_map_grid: Option<GridConfig>,
+    gain_map_tiles: TryVec<ItemExtents>,
+    gain_map_hevc_config: Option<HEVCConfig>,
     apple_gain_map: Option<ItemExtents>,
     apple_gain_map_hevc_config: Option<HEVCConfig>,
     gain_map_color_info: Option<ColorInformation>,
@@ -2238,6 +2241,9 @@ impl<'data> AvifParser<'data> {
                 xmp_item: None,
                 gain_map_metadata: None,
                 gain_map: None,
+                gain_map_grid: None,
+                gain_map_tiles: TryVec::new(),
+                gain_map_hevc_config: None,
                 apple_gain_map: None,
                 apple_gain_map_hevc_config: None,
                 gain_map_color_info: None,
@@ -2566,7 +2572,7 @@ impl<'data> AvifParser<'data> {
         // map" instead of failing the container. A gain map is an
         // enhancement, and a reader that cannot make sense of one owes the
         // caller the base image, not a refusal.
-        let (gain_map_metadata, gain_map, gain_map_color_info) = 'gain_map: {
+        let (gain_map_metadata, gain_map, gain_map_color_info, gain_map_item_id) = 'gain_map: {
             let tmap_item = meta.item_infos.iter()
                 .find(|info| info.item_type == b"tmap");
 
@@ -2610,10 +2616,10 @@ impl<'data> AvifParser<'data> {
                             &tmap_extents,
                         );
                         let Some(tmap_data) = tmap_data else {
-                            break 'gain_map (None, None, None);
+                            break 'gain_map (None, None, None, None);
                         };
                         let Ok(metadata) = parse_tone_map_image(&tmap_data) else {
-                            break 'gain_map (None, None, None);
+                            break 'gain_map (None, None, None, None);
                         };
 
                         // Get gain map image extents
@@ -2631,17 +2637,80 @@ impl<'data> AvifParser<'data> {
                             }
                         });
 
-                        (Some(metadata), Some(gmap_extents), alt_color)
+                        (Some(metadata), Some(gmap_extents), alt_color, Some(gmap_item_id))
                     } else {
-                        (None, None, None)
+                        (None, None, None, None)
                     }
                 } else {
-                    (None, None, None)
+                    (None, None, None, None)
                 }
             } else {
-                (None, None, None)
+                (None, None, None, None)
             }
         };
+
+        // A gain map can be a grid in its own right — Apple's HEIC exports
+        // tile theirs 512x512 — and the map item is not the primary, so none
+        // of the machinery below reaches it. Collected separately rather than
+        // generalised: the primary's grid is load-bearing for every file and
+        // is not worth disturbing to serve one that is not.
+        // The gain map's own HEVC record. A gridded map carries it on the
+        // TILES, the way a picture grid does, so both are looked at.
+        let gain_map_hevc_config = gain_map_item_id
+            .and_then(|id| {
+                hevc_config_for(&meta.properties, id).or_else(|| {
+                    meta.item_references
+                        .iter()
+                        .find(|iref| iref.from_item_id == id && iref.item_type == b"dimg")
+                        .and_then(|iref| hevc_config_for(&meta.properties, iref.to_item_id))
+                })
+            })
+            .map(TryClone::try_clone)
+            .transpose()
+            .map_err(|e| at!(Error::from(e)))?;
+
+        let (gain_map_grid, gain_map_tiles) = match (gain_map.as_ref(), gain_map_item_id) {
+            (Some(extents), Some(map_id)) => {
+                let is_map_grid = meta
+                    .item_infos
+                    .iter()
+                    .any(|info| info.item_id == map_id && info.item_type == b"grid");
+                match is_map_grid {
+                    true => {
+                        let mut tiles_with_index: TryVec<(u32, u16)> = TryVec::new();
+                        for iref in meta.item_references.iter() {
+                            if iref.from_item_id == map_id && iref.item_type == b"dimg" {
+                                tiles_with_index
+                                    .push((iref.to_item_id, iref.reference_index))
+                                    .map_err(|e| at!(Error::from(e)))?;
+                            }
+                        }
+                        tracker.validate_grid_tiles(tiles_with_index.len() as u32)?;
+                        tiles_with_index.sort_by_key(|&(_, idx)| idx);
+                        let mut tile_extents = TryVec::new();
+                        let mut tile_ids = TryVec::new();
+                        for (tile_id, _) in tiles_with_index.iter() {
+                            tile_extents
+                                .push(Self::get_item_extents(&meta, *tile_id)?)
+                                .map_err(|e| at!(Error::from(e)))?;
+                            tile_ids.push(*tile_id).map_err(|e| at!(Error::from(e)))?;
+                        }
+                        let config = Self::read_grid_from_payload(
+                            raw.as_ref(),
+                            &parsed.mdat_bounds,
+                            meta.idat.as_ref(),
+                            extents,
+                        )
+                        .unwrap_or(None)
+                        .map_or_else(|| Self::calculate_grid_config(&meta, &tile_ids), Ok)?;
+                        (Some(config), tile_extents)
+                    }
+                    false => (None, TryVec::new()),
+                }
+            }
+            _ => (None, TryVec::new()),
+        };
+
 
         // Extract properties for the primary item
         macro_rules! find_prop {
@@ -2859,6 +2928,9 @@ impl<'data> AvifParser<'data> {
             xmp_item,
             gain_map_metadata,
             gain_map,
+            gain_map_grid,
+            gain_map_tiles,
+            gain_map_hevc_config,
             apple_gain_map,
             apple_gain_map_hevc_config,
             gain_map_color_info,
@@ -3488,6 +3560,52 @@ impl<'data> AvifParser<'data> {
     #[must_use]
     pub fn compressed_extents(&self) -> Option<&ItemCompressedExtents> {
         self.compressed_extents.as_ref()
+    }
+
+    /// The gain map's own grid, when the map image is itself tiled.
+    ///
+    /// A gain map is an image like any other and may be stored as a grid —
+    /// Apple's HEIC exports tile theirs 512x512. `None` where the map is a
+    /// single coded item, which is the ordinary case and what every AVIF
+    /// writer produces.
+    ///
+    /// A caller seeing `Some` here must assemble the map from
+    /// [`Self::gain_map_tile_data`] rather than decoding
+    /// [`Self::gain_map_data`], which for a grid returns the grid descriptor
+    /// and not a picture.
+    #[must_use]
+    pub fn gain_map_grid_config(&self) -> Option<&GridConfig> {
+        self.gain_map_grid.as_ref()
+    }
+
+    /// How many tiles the gain map's grid has.
+    #[must_use]
+    pub fn gain_map_tile_count(&self) -> usize {
+        self.gain_map_tiles.len()
+    }
+
+    /// Coded bytes of one gain map tile, in `dimg` reference order.
+    ///
+    /// The order is the placement: reference index 0 is the top-left tile and
+    /// they run in raster order from there.
+    pub fn gain_map_tile_data(&self, index: usize) -> Result<Cow<'_, [u8]>> {
+        let item = self
+            .gain_map_tiles
+            .get(index)
+            .ok_or_else(|| at!(Error::InvalidData("gain map tile index out of bounds")))?;
+        self.resolve_item(item)
+    }
+
+    /// HEVC configuration for the gain map image, if it has its own.
+    ///
+    /// Needed for the reason [`Self::alpha_hevc_config`] is: a gain map is
+    /// separately coded and usually monochrome, so decoding it against the
+    /// picture's record returns a frame that is wrong rather than one that
+    /// fails. A gridded map keeps the record on its TILES, as a picture grid
+    /// does, and both are looked at.
+    #[must_use]
+    pub fn gain_map_hevc_config(&self) -> Option<&HEVCConfig> {
+        self.gain_map_hevc_config.as_ref()
     }
 
     /// Apple's HDR gain map image, if the file carries one.
