@@ -1877,9 +1877,13 @@ impl<'data> AvifParser<'data> {
         let mut mdat_bounds = TryVec::new();
         let mut animation_data: Option<ParsedAnimationData> = None;
 
+        let mut saw_mini_box = false;
         while let Some(mut b) = iter.next_box()? {
             stop.check().map_err(|e| at!(Error::from(e)))?;
 
+            if b.head.name == BoxType::UnknownBox(u32::from_be_bytes(*b"mini")) {
+                saw_mini_box = true;
+            }
             match b.head.name {
                 BoxType::MetadataBox => {
                     if meta.is_some() {
@@ -1913,6 +1917,15 @@ impl<'data> AvifParser<'data> {
         // meta is required for still images, but pure AVIF sequences (avis brand)
         // can have only moov+mdat with no meta box.
         if meta.is_none() && animation_data.is_none() {
+            // HEIF's third edition adds a low-overhead form that replaces the
+            // whole item structure with one `mini` box. A file using it is
+            // well formed and simply not something this parser reads yet;
+            // saying "missing meta" describes it as broken instead.
+            if saw_mini_box {
+                return Err(at!(Error::Unsupported(
+                    "low-overhead 'mini' HEIF, which carries no meta box"
+                )));
+            }
             return Err(at!(Error::InvalidData("missing meta")));
         }
 
@@ -2008,7 +2021,7 @@ impl<'data> AvifParser<'data> {
                     prop.item_id == item_id
                         && match &prop.property {
                             ItemProperty::AuxiliaryType(urn) => {
-                                urn.type_subtype().0 == b"urn:mpeg:mpegB:cicp:systems:auxiliary:alpha"
+                                is_alpha_auxiliary_urn(urn.type_subtype().0)
                             }
                             _ => false,
                         }
@@ -2347,6 +2360,25 @@ impl<'data> AvifParser<'data> {
                         color_info = Some(info.clone());
                     }
                     _ => {}
+                }
+            }
+        }
+        // A `grid` states no colour of its own -- the property sits on the
+        // tiles, exactly as the codec configuration does above -- so a grid
+        // image would otherwise report none at all. The tiles of a grid share
+        // one description, which is what makes taking the first sound.
+        if is_grid && color_info.is_none() && icc_color_info.is_none() {
+            for property in &meta.properties {
+                if let ItemProperty::ColorInformation(info) = &property.property {
+                    match info {
+                        ColorInformation::IccProfile(_) if icc_color_info.is_none() => {
+                            icc_color_info = Some(info.clone());
+                        }
+                        ColorInformation::Nclx { .. } if color_info.is_none() => {
+                            color_info = Some(info.clone());
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
@@ -4059,7 +4091,7 @@ pub fn read_avif_with_config<T: Read + ?Sized>(
                 prop.item_id == item_id
                     && match &prop.property {
                         ItemProperty::AuxiliaryType(urn) => {
-                            urn.type_subtype().0 == b"urn:mpeg:mpegB:cicp:systems:auxiliary:alpha"
+                            is_alpha_auxiliary_urn(urn.type_subtype().0)
                         }
                         _ => false,
                     }
@@ -4768,8 +4800,11 @@ fn is_supported_brand(brand: &FourCC) -> bool {
         | b"heic" | b"heix" | b"heim" | b"heis"
         // HEVC sequence
         | b"hevc" | b"hevx" | b"hevm" | b"hevs"
-        // MIAF, naming the shape without naming the codec
-        | b"mif1" | b"msf1"
+        // MIAF, naming the shape without naming the codec. `mif2` and `mif3`
+        // are the later editions of the same structural brand; a file that
+        // names one is still an item-based container, and turning it away on
+        // the strength of the digit refuses files libheif reads.
+        | b"mif1" | b"mif2" | b"mif3" | b"msf1"
     )
 }
 
@@ -5217,6 +5252,17 @@ fn read_auxc<T: Read>(src: &mut BMFFBox<'_, T>, options: &ParseOptions) -> Resul
 fn is_depth_auxiliary_urn(urn: &[u8]) -> bool {
     urn == b"urn:mpeg:mpegB:cicp:systems:auxiliary:depth"
         || urn == b"urn:mpeg:hevc:2015:auxid:2"
+}
+
+/// Does this `auxC` URN name an alpha plane?
+///
+/// Both spellings, like the depth one beside it. The HEVC form is what HEIC
+/// writers of the period emitted -- it is the only one in the Nokia
+/// conformance set and in libheif's own test files -- so recognising only the
+/// MPEG-B form reports those images as having no transparency at all.
+fn is_alpha_auxiliary_urn(urn: &[u8]) -> bool {
+    urn == b"urn:mpeg:mpegB:cicp:systems:auxiliary:alpha"
+        || urn == b"urn:mpeg:hevc:2015:auxid:1"
 }
 
 /// Parse an AV1 Codec Configuration property box
