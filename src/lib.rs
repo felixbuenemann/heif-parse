@@ -2601,23 +2601,82 @@ impl<'data> AvifParser<'data> {
             None => (None, None),
         };
 
-        // A grid whose transparency hangs off its TILES rather than off the
-        // grid item.
+        // A grid whose transparency is carried per TILE rather than by one
+        // item covering the whole assembly.
         //
-        // Two arrangements are legal and both are in the wild. The common one
-        // gives the alpha its own grid item, referenced from the colour grid
-        // by `auxl`, and that is what `alpha_item_id` above finds. The other
-        // has no alpha grid at all: each colour tile is referenced by its own
-        // alpha tile, and there is nothing attached to the grid item to find.
-        // libavif writes the second -- `libavif_color_grid_alpha_nogrid.avif`
-        // is exactly it -- and a reader that only looks at the grid item
-        // reports no transparency and renders the picture opaque.
+        // Two arrangements are legal and both are in the wild, and NEITHER
+        // yields decodable bytes from the alpha item alone:
         //
-        // Resolved in TILE ORDER, so index i of the alpha matches index i of
-        // the colour. A tile without an alpha of its own abandons the whole
-        // set rather than leaving a hole: a partially transparent assembly
-        // would be worse than an opaque one, because it would look deliberate.
-        let alpha_tiles = if grid_config.is_some() && alpha_item_id.is_none() {
+        //   A. The alpha is its own `grid` item, pointed at the colour grid by
+        //      `auxl`, with its own `dimg` tiles. `alpha_item_id` finds it, so
+        //      this looks handled -- but a grid item's payload is the grid BOX
+        //      (rows, columns, output size), not coded pixels, so handing it to
+        //      a decoder hands over a header. The tiles are the picture.
+        //   B. There is no alpha grid at all: each colour tile is referenced by
+        //      its own alpha tile, and nothing hangs off the grid item to find.
+        //      A reader that only looks there reports no transparency and
+        //      renders the picture opaque.
+        //
+        // libavif writes both -- `libavif_color_grid_alpha_grid_*.avif` is A,
+        // `libavif_color_grid_alpha_nogrid.avif` is B.
+        //
+        // Resolved in TILE ORDER either way, so index i of the alpha matches
+        // index i of the colour. A tile whose alpha cannot be found abandons
+        // the whole set rather than leaving a hole: a partially transparent
+        // assembly would be worse than an opaque one, because it would look
+        // deliberate.
+        let alpha_grid_id = alpha_item_id.filter(|id| {
+            meta.item_infos
+                .iter()
+                .any(|info| info.item_id == *id && info.item_type == b"grid")
+        });
+        let grid_tile_count = tiles.len();
+        let alpha_tiles = if let (Some(colour), Some(alpha_id)) =
+            (grid_config.as_ref(), alpha_grid_id)
+        {
+            // Arrangement A. The two grids must agree on their layout for
+            // index i to mean the same cell in both; a mismatch is left
+            // opaque rather than composited against the wrong cells.
+            let alpha_extents = Self::get_item_extents(&meta, alpha_id)?;
+            let alpha_grid = Self::read_grid_from_payload(
+                raw.as_ref(),
+                &parsed.mdat_bounds,
+                meta.idat.as_ref(),
+                &alpha_extents,
+            )
+            .unwrap_or(None);
+            let same_layout = alpha_grid.is_some_and(|alpha| {
+                alpha.rows == colour.rows && alpha.columns == colour.columns
+            });
+
+            let mut ordered: TryVec<(u32, u16)> = TryVec::new();
+            if same_layout {
+                for iref in meta.item_references.iter() {
+                    if iref.from_item_id == alpha_id && iref.item_type == b"dimg" {
+                        ordered
+                            .push((iref.to_item_id, iref.reference_index))
+                            .map_err(|e| at!(Error::from(e)))?;
+                    }
+                }
+                ordered.sort_by_key(|&(_, index)| index);
+            }
+
+            // One alpha tile per colour tile. Fewer would leave cells
+            // uncovered; more means the layout agreement above was
+            // coincidental and the correspondence is not index-for-index.
+            if !ordered.is_empty() && ordered.len() == grid_tile_count {
+                let mut found = TryVec::new();
+                for (tile_id, _) in ordered.iter() {
+                    presented_items.push(*tile_id).map_err(|e| at!(Error::from(e)))?;
+                    found
+                        .push(Self::get_item_extents(&meta, *tile_id)?)
+                        .map_err(|e| at!(Error::from(e)))?;
+                }
+                found
+            } else {
+                TryVec::new()
+            }
+        } else if grid_config.is_some() && alpha_item_id.is_none() {
             let mut ordered: TryVec<(u32, u16)> = TryVec::new();
             for iref in meta.item_references.iter() {
                 if iref.from_item_id == meta.primary_item_id && iref.item_type == b"dimg" {
