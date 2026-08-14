@@ -1945,6 +1945,7 @@ pub struct AvifParser<'data> {
     layered_image_indexing: Option<AV1LayeredImageIndexing>,
     unsupported_essential: TryVec<UnsupportedEssentialProperty>,
     presented_items: TryVec<u32>,
+    alpha_tiles: TryVec<ItemExtents>,
     exif_item: Option<ItemExtents>,
     xmp_item: Option<ItemExtents>,
     gain_map_metadata: Option<GainMapMetadata>,
@@ -2214,6 +2215,7 @@ impl<'data> AvifParser<'data> {
                 // no `ipma` to carry an essential flag either.
                 unsupported_essential: TryVec::new(),
                 presented_items: TryVec::new(),
+                alpha_tiles: TryVec::new(),
                 primary_item_id: 0,
                 derivation_transforms: TryVec::new(),
                 spatial_extents: None,
@@ -2599,6 +2601,70 @@ impl<'data> AvifParser<'data> {
             None => (None, None),
         };
 
+        // A grid whose transparency hangs off its TILES rather than off the
+        // grid item.
+        //
+        // Two arrangements are legal and both are in the wild. The common one
+        // gives the alpha its own grid item, referenced from the colour grid
+        // by `auxl`, and that is what `alpha_item_id` above finds. The other
+        // has no alpha grid at all: each colour tile is referenced by its own
+        // alpha tile, and there is nothing attached to the grid item to find.
+        // libavif writes the second -- `libavif_color_grid_alpha_nogrid.avif`
+        // is exactly it -- and a reader that only looks at the grid item
+        // reports no transparency and renders the picture opaque.
+        //
+        // Resolved in TILE ORDER, so index i of the alpha matches index i of
+        // the colour. A tile without an alpha of its own abandons the whole
+        // set rather than leaving a hole: a partially transparent assembly
+        // would be worse than an opaque one, because it would look deliberate.
+        let alpha_tiles = if grid_config.is_some() && alpha_item_id.is_none() {
+            let mut ordered: TryVec<(u32, u16)> = TryVec::new();
+            for iref in meta.item_references.iter() {
+                if iref.from_item_id == meta.primary_item_id && iref.item_type == b"dimg" {
+                    ordered
+                        .push((iref.to_item_id, iref.reference_index))
+                        .map_err(|e| at!(Error::from(e)))?;
+                }
+            }
+            ordered.sort_by_key(|&(_, index)| index);
+
+            let mut found = TryVec::new();
+            let mut complete = !ordered.is_empty();
+            for (tile_id, _) in ordered.iter() {
+                let alpha_for_tile = meta
+                    .item_references
+                    .iter()
+                    .filter(|iref| iref.to_item_id == *tile_id && iref.item_type == b"auxl")
+                    .map(|iref| iref.from_item_id)
+                    .find(|&candidate| {
+                        meta.properties.iter().any(|prop| {
+                            prop.item_id == candidate
+                                && match &prop.property {
+                                    ItemProperty::AuxiliaryType(urn) => {
+                                        is_alpha_auxiliary_urn(urn.type_subtype().0)
+                                    }
+                                    _ => false,
+                                }
+                        })
+                    });
+                match alpha_for_tile {
+                    Some(id) => {
+                        presented_items.push(id).map_err(|e| at!(Error::from(e)))?;
+                        found
+                            .push(Self::get_item_extents(&meta, id)?)
+                            .map_err(|e| at!(Error::from(e)))?;
+                    }
+                    None => {
+                        complete = false;
+                        break;
+                    }
+                }
+            }
+            if complete { found } else { TryVec::new() }
+        } else {
+            TryVec::new()
+        };
+
         // Detect gain map (tmap derived image item)
         // Labelled so that anything unreadable inside can yield "no gain
         // map" instead of failing the container. A gain map is an
@@ -2968,6 +3034,7 @@ impl<'data> AvifParser<'data> {
                 cloned
             },
             presented_items,
+            alpha_tiles,
             exif_item,
             xmp_item,
             gain_map_metadata,
@@ -3399,6 +3466,31 @@ impl<'data> AvifParser<'data> {
     pub fn tile_data(&self, index: usize) -> Result<Cow<'_, [u8]>> {
         let item = self.tiles.get(index)
             .ok_or_else(|| at!(Error::InvalidData("tile index out of bounds")))?;
+        self.resolve_item(item)
+    }
+
+    /// How many alpha tiles a grid carries when its transparency hangs off
+    /// the TILES rather than off the grid item.
+    ///
+    /// Zero for every other shape, including the commoner arrangement where
+    /// the alpha is a grid of its own and [`Self::alpha_data`] finds it. Both
+    /// are legal; libavif writes this one.
+    ///
+    /// Either all of a grid's tiles have an alpha or none are reported: a
+    /// half-transparent assembly would look deliberate, which is worse than an
+    /// opaque one that is obviously missing something.
+    #[must_use]
+    pub fn alpha_tile_count(&self) -> usize {
+        self.alpha_tiles.len()
+    }
+
+    /// One alpha tile's coded data, indexed as [`Self::tile_data`] is, so
+    /// index `i` is the mask for colour tile `i`.
+    pub fn alpha_tile_data(&self, index: usize) -> Result<Cow<'_, [u8]>> {
+        let item = self
+            .alpha_tiles
+            .get(index)
+            .ok_or_else(|| at!(Error::InvalidData("alpha tile index out of bounds")))?;
         self.resolve_item(item)
     }
 
