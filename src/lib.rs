@@ -1943,6 +1943,8 @@ pub struct AvifParser<'data> {
     operating_point: Option<OperatingPointSelector>,
     layer_selector: Option<LayerSelector>,
     layered_image_indexing: Option<AV1LayeredImageIndexing>,
+    unsupported_essential: TryVec<UnsupportedEssentialProperty>,
+    presented_items: TryVec<u32>,
     exif_item: Option<ItemExtents>,
     xmp_item: Option<ItemExtents>,
     gain_map_metadata: Option<GainMapMetadata>,
@@ -2208,7 +2210,10 @@ impl<'data> AvifParser<'data> {
                 thumbnails: TryVec::new(),
                 animation_data,
                 premultiplied_alpha: false,
-                // A file that is only a track has no items to number.
+                // A file that is only a track has no items to number, and so
+                // no `ipma` to carry an essential flag either.
+                unsupported_essential: TryVec::new(),
+                presented_items: TryVec::new(),
                 primary_item_id: 0,
                 derivation_transforms: TryVec::new(),
                 spatial_extents: None,
@@ -2266,6 +2271,18 @@ impl<'data> AvifParser<'data> {
         // it has none of either itself.
         let derivation = derivation_chain(&meta, meta.primary_item_id)?;
         let coded_item_id = derivation[derivation.len() - 1];
+
+        // The items this context will actually read, gathered as they are
+        // found. A file may hold items we never touch -- other layers, other
+        // grids, items that reference the primary rather than the other way
+        // round -- and a fault in one of those is no reason to decline the
+        // picture. Only [`Self::presented_item_ids`] reads this; it exists so
+        // that "we cannot present this item" can be asked about the right
+        // items rather than about the file.
+        let mut presented_items: TryVec<u32> = TryVec::new();
+        for item_id in derivation.iter() {
+            presented_items.push(*item_id).map_err(|e| at!(Error::from(e)))?;
+        }
         // Every link's transformative properties, in the order a decoder
         // applies them. The single-property accessors below report the primary
         // item's only, which is the whole chain exactly when it is one link.
@@ -2293,6 +2310,10 @@ impl<'data> AvifParser<'data> {
                         }
                 })
             });
+
+        if let Some(id) = alpha_item_id {
+            presented_items.push(id).map_err(|e| at!(Error::from(e)))?;
+        }
 
         let alpha = alpha_item_id
             .map(|id| Self::get_item_extents(&meta, id))
@@ -2328,6 +2349,9 @@ impl<'data> AvifParser<'data> {
                         }
                 })
             });
+        if let Some(id) = apple_gain_map_item_id {
+            presented_items.push(id).map_err(|e| at!(Error::from(e)))?;
+        }
         let apple_gain_map = apple_gain_map_item_id
             .map(|id| Self::get_item_extents(&meta, id))
             .transpose()?;
@@ -2367,6 +2391,7 @@ impl<'data> AvifParser<'data> {
 
         let (depth_item, depth_width, depth_height, depth_av1_config, depth_color_info) =
             if let Some(depth_id) = depth_item_id {
+                presented_items.push(depth_id).map_err(|e| at!(Error::from(e)))?;
                 let extents = Self::get_item_extents(&meta, depth_id)?;
                 // Get dimensions from ispe property
                 let dims = meta.properties.iter().find_map(|p| {
@@ -2461,6 +2486,7 @@ impl<'data> AvifParser<'data> {
                     (ItemProperty::CleanAperture(c), true) => Some(*c),
                     _ => None,
                 });
+            presented_items.push(item_id).map_err(|e| at!(Error::from(e)))?;
             let extents = Self::get_item_extents(&meta, item_id)?;
             // The thumbnail's own `hvcC`, read here because the properties are
             // only in scope during the parse. A thumbnail is a separately
@@ -2493,6 +2519,12 @@ impl<'data> AvifParser<'data> {
 
             tracker.validate_grid_tiles(tiles_with_index.len() as u32)?;
             tiles_with_index.sort_by_key(|&(_, idx)| idx);
+
+            // A grid's tiles ARE the picture, so a property we cannot read on
+            // one of them is not a detail on the side.
+            for (tile_id, _) in tiles_with_index.iter() {
+                presented_items.push(*tile_id).map_err(|e| at!(Error::from(e)))?;
+            }
 
             let mut tile_extents = TryVec::new();
             for (tile_id, _) in tiles_with_index.iter() {
@@ -2593,6 +2625,10 @@ impl<'data> AvifParser<'data> {
                     let gmap_item_id = inputs[1].0;
 
                     if base_item_id == meta.primary_item_id {
+                        // The `tmap` derivation and the gain map it names are
+                        // both read from here on.
+                        presented_items.push(tmap_id).map_err(|e| at!(Error::from(e)))?;
+                        presented_items.push(gmap_item_id).map_err(|e| at!(Error::from(e)))?;
                         // Read tmap item's data payload (ToneMapImage).
                         //
                         // From `idat` as readily as from `mdat`. A derived
@@ -2924,6 +2960,14 @@ impl<'data> AvifParser<'data> {
             operating_point,
             layer_selector,
             layered_image_indexing,
+            unsupported_essential: {
+                let mut cloned = TryVec::new();
+                for entry in &meta.unsupported_essential {
+                    cloned.push(entry.clone()).map_err(|e| at!(Error::from(e)))?;
+                }
+                cloned
+            },
+            presented_items,
             exif_item,
             xmp_item,
             gain_map_metadata,
@@ -3477,6 +3521,42 @@ impl<'data> AvifParser<'data> {
     #[must_use]
     pub fn primary_item_id(&self) -> u32 {
         self.primary_item_id
+    }
+
+    /// Property boxes this parser does not implement, on items whose `ipma`
+    /// marks them essential.
+    ///
+    /// Empty unless the file uses something outside this parser's vocabulary.
+    /// Strict parsing never returns a context at all in that case; lenient
+    /// parsing reads the file and reports this instead, so that a caller only
+    /// describing the container is unaffected while a caller about to PRESENT
+    /// an item can refuse it.
+    ///
+    /// Refusing matters because essential means the property changes what the
+    /// item is. A reader that ignores one does not fail -- it succeeds at
+    /// producing the wrong picture, and hands it over as if it were right.
+    /// Scoped by item id: a property on some other item is no reason to
+    /// decline a primary that does not carry it. Pair this with
+    /// [`Self::presented_item_ids`] rather than reacting to any entry, or a
+    /// file whose unrelated items are exotic gets declined over a picture that
+    /// reads perfectly well.
+    #[must_use]
+    pub fn unsupported_essential_properties(&self) -> &[UnsupportedEssentialProperty] {
+        &self.unsupported_essential
+    }
+
+    /// The items this context resolved in order to present the primary: its
+    /// derivation chain, its grid tiles, and the alpha, depth, thumbnail and
+    /// gain-map items hanging off it.
+    ///
+    /// A container is free to hold items no reader of the primary ever touches
+    /// -- other coded layers, tiles of a different grid, items that reference
+    /// the primary rather than the other way round -- and this excludes them.
+    /// It exists so a caller can ask about the items it is going to READ, and
+    /// unordered because it answers membership only.
+    #[must_use]
+    pub fn presented_item_ids(&self) -> &[u32] {
+        &self.presented_items
     }
 
     /// Get the primary item's dimensions from its `ispe` property, if present.
@@ -4067,6 +4147,11 @@ impl ExactSizeIterator for FrameIterator<'_> {
 struct AvifInternalMeta {
     item_references: TryVec<SingleItemTypeReferenceBox>,
     properties: TryVec<AssociatedProperty>,
+    /// Associations the parser could not honour: an essential property whose
+    /// box it does not implement. Empty for every well-formed file it fully
+    /// understands. Strict parsing never gets this far -- it errors instead --
+    /// so this is what lenient parsing carries forward in its place.
+    unsupported_essential: TryVec<UnsupportedEssentialProperty>,
     primary_item_id: u32,
     iloc_items: TryVec<ItemLocationBoxItem>,
     item_infos: TryVec<ItemInfoEntry>,
@@ -5440,6 +5525,7 @@ fn read_avif_meta<T: Read + Offset>(src: &mut BMFFBox<'_, T>, options: &ParseOpt
     let mut iloc_items = None;
     let mut item_references = TryVec::new();
     let mut properties = TryVec::new();
+    let mut unsupported_essential = TryVec::new();
     let mut idat = None;
     let mut entity_groups = TryVec::new();
 
@@ -5468,7 +5554,9 @@ fn read_avif_meta<T: Read + Offset>(src: &mut BMFFBox<'_, T>, options: &ParseOpt
                 item_references.append(&mut read_iref(&mut b, options)?).map_err(|e| at!(Error::from(e)))?;
             },
             BoxType::ImagePropertiesBox => {
-                properties = read_iprp(&mut b, options)?;
+                let (associated, unsupported) = read_iprp(&mut b, options)?;
+                properties = associated;
+                unsupported_essential = unsupported;
             },
             BoxType::ItemDataBox => {
                 if idat.is_some() {
@@ -5507,6 +5595,7 @@ fn read_avif_meta<T: Read + Offset>(src: &mut BMFFBox<'_, T>, options: &ParseOpt
 
     Ok(AvifInternalMeta {
         properties,
+        unsupported_essential,
         item_references,
         primary_item_id,
         iloc_items: iloc_items.ok_or_else(|| at!(Error::InvalidData("iloc missing")))?,
@@ -5697,7 +5786,29 @@ const MUST_BE_ESSENTIAL: &[&[u8; 4]] = &[b"a1op", b"lsel", b"clap", b"irot", b"i
 /// See AVIF § 2.3.2.3.2 (a1lx).
 const MUST_NOT_BE_ESSENTIAL: &[&[u8; 4]] = &[b"a1lx"];
 
-fn read_iprp<T: Read>(src: &mut BMFFBox<'_, T>, options: &ParseOptions) -> Result<TryVec<AssociatedProperty>> {
+/// An item property this parser does not understand, on an item whose `ipma`
+/// says understanding it is required.
+///
+/// Retained rather than dropped so a caller can decide per item. Lenient
+/// parsing exists so that a *flag on a property we do apply* -- a `clap` whose
+/// essential bit is set the wrong way -- cannot cost a reader the whole file.
+/// That reasoning does not reach a property we cannot read at all: "this
+/// changes nothing about the samples" is exactly the judgement we are unable
+/// to make. Describing such a file is still useful, so this is reported rather
+/// than refused, and the decision of what to do with it belongs to whoever is
+/// about to present the item.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnsupportedEssentialProperty {
+    /// The item the property is associated with.
+    pub item_id: u32,
+    /// The property box type, so a refusal can name what caused it.
+    pub fourcc: FourCC,
+}
+
+fn read_iprp<T: Read>(
+    src: &mut BMFFBox<'_, T>,
+    options: &ParseOptions,
+) -> Result<(TryVec<AssociatedProperty>, TryVec<UnsupportedEssentialProperty>)> {
     let mut iter = src.box_iter();
     let mut properties = TryVec::new();
     let mut associations = TryVec::new();
@@ -5721,6 +5832,7 @@ fn read_iprp<T: Read>(src: &mut BMFFBox<'_, T>, options: &ParseOptions) -> Resul
     }
 
     let mut associated = TryVec::new();
+    let mut unsupported_essential = TryVec::new();
     for a in associations {
         let index = match a.property_index {
             0 => {
@@ -5771,6 +5883,16 @@ fn read_iprp<T: Read>(src: &mut BMFFBox<'_, T>, options: &ParseOptions) -> Resul
                 "item {} has unsupported property {} marked essential; item will be unusable",
                 a.item_id, entry.fourcc
             );
+            // Recorded even when lenient, because leniency here is about not
+            // losing a readable file over a misplaced flag, not about
+            // presenting an item whose own file says we cannot present it.
+            // The caller sees which item and which property and decides.
+            unsupported_essential
+                .push(UnsupportedEssentialProperty {
+                    item_id: a.item_id,
+                    fourcc: entry.fourcc.clone(),
+                })
+                .map_err(|e| at!(Error::from(e)))?;
             if !options.lenient {
                 return Err(at!(Error::Unsupported(
                     "unsupported property marked as essential",
@@ -5779,7 +5901,7 @@ fn read_iprp<T: Read>(src: &mut BMFFBox<'_, T>, options: &ParseOptions) -> Resul
         }
         // Unknown non-essential properties are silently skipped (they're optional)
     }
-    Ok(associated)
+    Ok((associated, unsupported_essential))
 }
 
 #[derive(Debug, PartialEq)]
@@ -7125,6 +7247,9 @@ fn expand_mini(mini: &MiniImage, payload: TryVec<u8>, item_type: [u8; 4]) -> Res
         item_infos,
         idat: Some(payload),
         entity_groups: TryVec::new(),
+        // A `mini` box has no `ipma`, so there is no essential flag to honour
+        // or to miss: every property here is one this function synthesised.
+        unsupported_essential: TryVec::new(),
     })
 }
 
