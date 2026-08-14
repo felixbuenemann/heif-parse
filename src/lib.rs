@@ -8663,6 +8663,7 @@ mod sample_offset_overflow_tests {
             item_infos,
             idat: None,
             entity_groups: TryVec::new(),
+            unsupported_essential: TryVec::new(),
         };
 
         let chain = derivation_chain(&meta, 3).unwrap();
@@ -8719,6 +8720,7 @@ mod sample_offset_overflow_tests {
             item_infos,
             idat: None,
             entity_groups: TryVec::new(),
+            unsupported_essential: TryVec::new(),
         };
         assert!(derivation_chain(&meta, 1).is_err());
     }
