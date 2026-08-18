@@ -7099,6 +7099,159 @@ impl<'a> MiniBits<'a> {
     }
 }
 
+#[cfg(test)]
+mod mini_tests {
+    /// Bit-packed writer, so a test can build the header a `mini` box holds.
+    struct Bits {
+        bytes: std::vec::Vec<u8>,
+        position: usize,
+    }
+
+    impl Bits {
+        fn new() -> Self {
+            Self { bytes: std::vec::Vec::new(), position: 0 }
+        }
+
+        fn push(&mut self, value: u32, count: u32) {
+            for shift in (0..count).rev() {
+                if self.position.is_multiple_of(8) {
+                    self.bytes.push(0);
+                }
+                let last = self.bytes.len() - 1;
+                let bit = ((value >> shift) & 1) as u8;
+                self.bytes[last] |= bit << (7 - (self.position % 8));
+                self.position += 1;
+            }
+        }
+
+        fn align(&mut self) {
+            while !self.position.is_multiple_of(8) {
+                self.push(0, 1);
+            }
+        }
+    }
+
+    /// A minimal but complete `HEVCDecoderConfigurationRecord`: monochrome,
+    /// eight bits, four-byte NAL prefixes, no parameter-set arrays.
+    fn hvcc() -> std::vec::Vec<u8> {
+        let mut record = std::vec::Vec::new();
+        record.push(1); // configurationVersion
+        record.push(1); // profile_space 0 | tier 0 | profile_idc 1
+        record.extend_from_slice(&0x6000_0000_u32.to_be_bytes());
+        record.extend_from_slice(&[0; 6]); // constraint flags
+        record.push(60); // general_level_idc
+        record.extend_from_slice(&[0xf0, 0x00]); // min_spatial_segmentation_idc
+        record.push(0xfc); // parallelismType
+        record.push(0xfc); // chroma_format_idc 0
+        record.push(0xf8); // bit_depth_luma_minus8 0
+        record.push(0xf8); // bit_depth_chroma_minus8 0
+        record.extend_from_slice(&[0, 0]); // avgFrameRate
+        record.push(0x0f); // lengthSizeMinusOne 3
+        record.push(0); // numOfArrays
+        assert_eq!(record.len(), 23);
+        record
+    }
+
+    /// A single-image HEIF whose whole item model is one `mini` box.
+    fn mini_file(config: &[u8], data: &[u8]) -> std::vec::Vec<u8> {
+        let mut bits = Bits::new();
+        bits.push(0, 2); // version
+        for flag in [0, 0, 1, 0, 0, 0, 0, 0, 0] {
+            // explicit_codec_types, float, full_range, alpha, explicit_cicp,
+            // hdr, icc, exif, xmp
+            bits.push(flag, 1);
+        }
+        bits.push(0, 2); // chroma_subsampling: monochrome, so no centring flags
+        bits.push(0, 3); // orientation
+        bits.push(0, 1); // large_dimensions: seven-bit dimensions
+        bits.push(15, 7); // width - 1
+        bits.push(15, 7); // height - 1
+        bits.push(0, 1); // high_bit_depth
+        bits.push(1, 1); // large_codec_config: twelve-bit size
+        bits.push(0, 1); // large_item_data: fifteen-bit size
+        bits.push(config.len() as u32, 12);
+        bits.push(data.len() as u32 - 1, 15);
+        bits.align();
+
+        let mut payload = bits.bytes;
+        payload.extend_from_slice(config);
+        payload.extend_from_slice(data);
+
+        let mut file = std::vec::Vec::new();
+        file.extend_from_slice(&16_u32.to_be_bytes());
+        file.extend_from_slice(b"ftyp");
+        file.extend_from_slice(b"mif3");
+        file.extend_from_slice(&0_u32.to_be_bytes());
+        file.extend_from_slice(&((payload.len() + 8) as u32).to_be_bytes());
+        file.extend_from_slice(b"mini");
+        file.extend_from_slice(&payload);
+        file
+    }
+
+    /// The happy path, so the refusal below is a refusal of something and not
+    /// of everything.
+    #[test]
+    fn a_mini_box_yields_its_codec_configuration() {
+        let file = mini_file(&hvcc(), &[0xaa, 0xbb, 0xcc, 0xdd]);
+        let parser = super::AvifParser::from_bytes(&file).expect("parses");
+        let config = parser.hevc_config().expect("carries an hvcC");
+        assert_eq!(config.general_profile_idc, 1);
+        assert_eq!(config.chroma_format_idc, 0, "monochrome");
+        assert_eq!(config.bit_depth_luma, 8);
+        assert_eq!(config.nal_length_size, 4);
+        assert_eq!(
+            parser.spatial_extents().map(|e| (e.width, e.height)),
+            Some((16, 16))
+        );
+        assert_eq!(
+            parser.primary_data().expect("data").as_ref(),
+            &[0xaa, 0xbb, 0xcc, 0xdd]
+        );
+    }
+
+    /// A codec configuration that will not parse must refuse the file.
+    ///
+    /// It used to be discarded without a word, which left a file that read as
+    /// a valid picture with no codec at all -- indistinguishable, to a
+    /// caller, from a codec this crate does not support. And the likeliest
+    /// cause is that the header before it was read wrongly, in which case
+    /// every other extent the box names is suspect too, so presenting the
+    /// picture would be worse than declining it.
+    ///
+    /// `lightning_mini.heif` of libheif's own test data is the real instance:
+    /// it is written to a superseded draft of Annex A in which
+    /// `large_dimensions_flag` had the opposite sense, so a reader following
+    /// the published layout lands two bytes into the record and finds no
+    /// version byte. libheif returns an error there too.
+    #[test]
+    fn a_mini_box_whose_codec_configuration_is_unreadable_is_refused() {
+        let mut broken = hvcc();
+        broken[0] = 0x70; // not a configurationVersion
+        let file = mini_file(&broken, &[0xaa, 0xbb, 0xcc, 0xdd]);
+
+        let Err(error) = super::AvifParser::from_bytes(&file) else {
+            panic!("a file whose codec configuration will not parse must be refused");
+        };
+        match error.decompose().0 {
+            super::Error::InvalidData(message) => {
+                assert!(
+                    message.contains("codec configuration"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    /// A record too short to hold the fixed fields is the same refusal, not a
+    /// truncated read.
+    #[test]
+    fn a_truncated_codec_configuration_is_refused() {
+        let file = mini_file(&hvcc()[..20], &[0xaa, 0xbb, 0xcc, 0xdd]);
+        assert!(super::AvifParser::from_bytes(&file).is_err());
+    }
+}
+
 /// What a `mini` box says, in the terms the item model uses.
 struct MiniImage {
     width: u32,
@@ -7463,6 +7616,12 @@ fn expand_mini(mini: &MiniImage, payload: TryVec<u8>, item_type: [u8; 4]) -> Res
     // The codec configuration, which the box holds as bare bytes where an
     // ordinary file holds an `av1C` or `hvcC` property. Without it a reader
     // knows the picture's size and nothing about how to decode it.
+    //
+    // A configuration that will not parse is a refusal, not a shrug. Dropping
+    // it leaves a file that looks like a picture with no codec, which no
+    // caller can tell apart from a codec this reader does not support -- and
+    // the likeliest cause is that the header before it was read wrongly, so
+    // every other extent is suspect too.
     let config = payload
         .get(mini.main_config.start as usize..mini.main_config.end as usize)
         .unwrap_or(&[]);
@@ -7472,14 +7631,17 @@ fn expand_mini(mini: &MiniImage, payload: TryVec<u8>, item_type: [u8; 4]) -> Res
         } else {
             read_hvcc_bytes(config).map(ItemProperty::HEVCConfig)
         };
-        if let Some(property) = property {
-            properties
-                .push(AssociatedProperty {
-                    item_id: MAIN,
-                    property,
-                })
-                .map_err(|e| at!(Error::from(e)))?;
-        }
+        let property = property.ok_or_else(|| {
+            at!(Error::InvalidData(
+                "'mini' box codec configuration is not a valid record"
+            ))
+        })?;
+        properties
+            .push(AssociatedProperty {
+                item_id: MAIN,
+                property,
+            })
+            .map_err(|e| at!(Error::from(e)))?;
     }
 
     let mut item_references = TryVec::new();
