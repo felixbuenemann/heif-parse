@@ -2609,3 +2609,65 @@ fn an_audio_track_beside_a_still_is_not_a_missing_picture() {
     );
     assert!(parser.spatial_extents().is_some(), "the still is still there");
 }
+
+// ============================================================================
+// Per-tile decoder configuration
+// ============================================================================
+
+/// The HEIC conformance corpus, when it is checked out beside this crate.
+/// It holds the only public HEVC grids, which is what the per-tile accessors
+/// exist for; the AVIF samples this file otherwise uses have no `hvcC`.
+fn corpus_file(relative: &str) -> Option<std::vec::Vec<u8>> {
+    let base = std::env::var("HEIF_CONFORMANCE")
+        .unwrap_or_else(|_| "../codec-corpus/heic-conformance/valid".to_string());
+    std::fs::read(std::path::Path::new(&base).join(relative)).ok()
+}
+
+/// A grid's tiles are separately coded pictures, and a decoder that reuses
+/// one tile's parameter sets for all of them decodes the rest against the
+/// wrong SPS -- a picture of the wrong shape rather than a clean failure.
+#[test]
+fn grid_tiles_report_their_own_decoder_configurations() {
+    for (name, rows, columns) in [
+        ("nokia-conformance/C007.heic", 2u8, 2u8),
+        ("dsoprea-exif/image1.heic", 6, 8),
+    ] {
+        let Some(bytes) = corpus_file(name) else {
+            eprintln!("skipping {name}: conformance corpus not present");
+            continue;
+        };
+        let parser = heif_parse::AvifParser::from_bytes(&bytes).expect("parse");
+        let grid = parser.grid_config().expect("is a grid");
+        assert_eq!((grid.rows, grid.columns), (rows, columns), "{name}");
+
+        let count = usize::from(rows) * usize::from(columns);
+        for index in 0..count {
+            let config = parser
+                .tile_hevc_config(index)
+                .unwrap_or_else(|| panic!("{name} tile {index} carries an hvcC"));
+            assert_eq!(config.chroma_format_idc, 1, "{name} tile {index}");
+            assert_eq!(config.bit_depth_luma, 8, "{name} tile {index}");
+            assert!(matches!(config.nal_length_size, 1 | 2 | 4));
+            assert!(
+                !config.parameter_sets.is_empty(),
+                "{name} tile {index} carries parameter sets"
+            );
+        }
+        assert!(parser.tile_hevc_config(count).is_none(), "{name} past the last tile");
+    }
+}
+
+/// An item that is not a grid has no tiles to ask about, and asking must
+/// answer that rather than reaching for the primary item's record.
+#[test]
+fn a_single_picture_has_no_per_tile_configuration() {
+    let Some(bytes) = corpus_file("libheif-testdata/example.heic") else {
+        eprintln!("skipping: conformance corpus not present");
+        return;
+    };
+    let parser = heif_parse::AvifParser::from_bytes(&bytes).expect("parse");
+    assert!(parser.grid_config().is_none());
+    assert!(parser.hevc_config().is_some(), "the picture itself has one");
+    assert!(parser.tile_hevc_config(0).is_none());
+    assert!(parser.alpha_tile_hevc_config(0).is_none());
+}

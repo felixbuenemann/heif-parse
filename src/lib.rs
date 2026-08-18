@@ -503,6 +503,15 @@ pub struct HEVCConfig {
     pub general_tier_flag: bool,
     /// `general_profile_idc` (1 = Main, 2 = Main 10, 3 = Main Still Picture).
     pub general_profile_idc: u8,
+    /// `general_profile_compatibility_flags`, bit *i* set when the stream
+    /// conforms to `general_profile_idc` *i*. A Main Still Picture stream
+    /// commonly sets bits 1..=3, and RExt streams set a bit for a profile
+    /// their `general_profile_idc` does not name.
+    pub general_profile_compatibility_flags: u32,
+    /// `general_constraint_indicator_flags`, forty-eight bits. Bit 0 of byte 0
+    /// is `general_progressive_source_flag`; the still-picture and
+    /// bit-depth constraints live further in.
+    pub general_constraint_indicator_flags: [u8; 6],
     /// `general_level_idc`, thirty times the level number.
     pub general_level_idc: u8,
     /// `chroma_format_idc` (0 = monochrome, 1 = 4:2:0, 2 = 4:2:2, 3 = 4:4:4).
@@ -544,6 +553,8 @@ impl TryClone for HEVCConfig {
             general_profile_space: self.general_profile_space,
             general_tier_flag: self.general_tier_flag,
             general_profile_idc: self.general_profile_idc,
+            general_profile_compatibility_flags: self.general_profile_compatibility_flags,
+            general_constraint_indicator_flags: self.general_constraint_indicator_flags,
             general_level_idc: self.general_level_idc,
             chroma_format_idc: self.chroma_format_idc,
             bit_depth_luma: self.bit_depth_luma,
@@ -1946,6 +1957,8 @@ pub struct AvifParser<'data> {
     unsupported_essential: TryVec<UnsupportedEssentialProperty>,
     presented_items: TryVec<u32>,
     alpha_tiles: TryVec<ItemExtents>,
+    tile_hevc_configs: TryVec<Option<HEVCConfig>>,
+    alpha_tile_hevc_configs: TryVec<Option<HEVCConfig>>,
     exif_item: Option<ItemExtents>,
     xmp_item: Option<ItemExtents>,
     gain_map_metadata: Option<GainMapMetadata>,
@@ -2216,6 +2229,8 @@ impl<'data> AvifParser<'data> {
                 unsupported_essential: TryVec::new(),
                 presented_items: TryVec::new(),
                 alpha_tiles: TryVec::new(),
+                tile_hevc_configs: TryVec::new(),
+                alpha_tile_hevc_configs: TryVec::new(),
                 primary_item_id: 0,
                 derivation_transforms: TryVec::new(),
                 spatial_extents: None,
@@ -2452,12 +2467,11 @@ impl<'data> AvifParser<'data> {
             }
         }
 
-        // Check if primary item is a grid (tiled image)
-        let is_grid = meta
-            .item_infos
-            .iter()
-            .find(|x| x.item_id == meta.primary_item_id)
-            .is_some_and(|info| info.item_type == b"grid");
+        // Whether the picture is a grid, asked of the item that carries the
+        // coded data. An `iden` wrapping a grid presents the assembly under
+        // its own crop or rotation, and asking the `iden` would answer "no"
+        // and leave the tiles unread.
+        let is_grid = item_is_grid(&meta, coded_item_id);
 
         // Thumbnails reference the image they stand in for, so the reference
         // runs from the thumbnail to the primary item, not the other way.
@@ -2511,10 +2525,10 @@ impl<'data> AvifParser<'data> {
         }
 
         // Extract grid configuration and tile extents if this is a grid
-        let (grid, tiles) = if is_grid {
+        let (grid, tiles, tile_hevc_configs) = if is_grid {
             let mut tiles_with_index: TryVec<(u32, u16)> = TryVec::new();
             for iref in meta.item_references.iter() {
-                if iref.from_item_id == meta.primary_item_id && iref.item_type == b"dimg" {
+                if iref.from_item_id == coded_item_id && iref.item_type == b"dimg" {
                     tiles_with_index.push((iref.to_item_id, iref.reference_index)).map_err(|e| at!(Error::from(e)))?;
                 }
             }
@@ -2536,6 +2550,21 @@ impl<'data> AvifParser<'data> {
             let mut tile_ids = TryVec::new();
             for (tile_id, _) in tiles_with_index.iter() {
                 tile_ids.push(*tile_id).map_err(|e| at!(Error::from(e)))?;
+            }
+
+            // Each tile's own `hvcC`, read here because the properties are
+            // only in scope during the parse. Tiles of one grid may carry
+            // different configurations -- a decoder that reuses the first
+            // tile's parameter sets for all of them decodes the rest against
+            // the wrong SPS, which is the defect `alpha_hevc_config` and
+            // `thumbnail_hevc_config` already exist to avoid.
+            let mut tile_configs: TryVec<Option<HEVCConfig>> = TryVec::new();
+            for (tile_id, _) in tiles_with_index.iter() {
+                let config = hevc_config_for(&meta.properties, *tile_id)
+                    .map(TryClone::try_clone)
+                    .transpose()
+                    .map_err(|e| at!(Error::from(e)))?;
+                tile_configs.push(config).map_err(|e| at!(Error::from(e)))?;
             }
 
             // The grid box is the derived item's payload, not a property of
@@ -2577,7 +2606,7 @@ impl<'data> AvifParser<'data> {
                     _ => None,
                 })
             });
-            (Some((grid_config, tile_size)), tile_extents)
+            (Some((grid_config, tile_size)), tile_extents, tile_configs)
         } else {
             // Non-grid primary: enforce total_megapixels_limit on the primary
             // item's ispe dimensions if present. H1 of 2026-05-06 audit.
@@ -2594,7 +2623,7 @@ impl<'data> AvifParser<'data> {
             if let Some((w, h)) = primary_dims {
                 tracker.validate_total_megapixels(w, h)?;
             }
-            (None, TryVec::new())
+            (None, TryVec::new(), TryVec::new())
         };
         let (grid_config, grid_tile_extents) = match grid {
             Some((config, tile_size)) => (Some(config), tile_size),
@@ -2631,6 +2660,7 @@ impl<'data> AvifParser<'data> {
                 .any(|info| info.item_id == *id && info.item_type == b"grid")
         });
         let grid_tile_count = tiles.len();
+        let mut alpha_tile_ids: TryVec<u32> = TryVec::new();
         let alpha_tiles = if let (Some(colour), Some(alpha_id)) =
             (grid_config.as_ref(), alpha_grid_id)
         {
@@ -2668,6 +2698,7 @@ impl<'data> AvifParser<'data> {
                 let mut found = TryVec::new();
                 for (tile_id, _) in ordered.iter() {
                     presented_items.push(*tile_id).map_err(|e| at!(Error::from(e)))?;
+                    alpha_tile_ids.push(*tile_id).map_err(|e| at!(Error::from(e)))?;
                     found
                         .push(Self::get_item_extents(&meta, *tile_id)?)
                         .map_err(|e| at!(Error::from(e)))?;
@@ -2709,6 +2740,7 @@ impl<'data> AvifParser<'data> {
                 match alpha_for_tile {
                     Some(id) => {
                         presented_items.push(id).map_err(|e| at!(Error::from(e)))?;
+                        alpha_tile_ids.push(id).map_err(|e| at!(Error::from(e)))?;
                         found
                             .push(Self::get_item_extents(&meta, id)?)
                             .map_err(|e| at!(Error::from(e)))?;
@@ -2719,10 +2751,27 @@ impl<'data> AvifParser<'data> {
                     }
                 }
             }
-            if complete { found } else { TryVec::new() }
+            if complete {
+                found
+            } else {
+                alpha_tile_ids.clear();
+                TryVec::new()
+            }
         } else {
             TryVec::new()
         };
+
+        // Each alpha tile's own `hvcC`, index-aligned with `alpha_tiles`.
+        // An alpha auxiliary is commonly coded monochrome while the colour
+        // tile beside it is 4:2:0, so the two cannot share a record.
+        let mut alpha_tile_hevc_configs: TryVec<Option<HEVCConfig>> = TryVec::new();
+        for tile_id in alpha_tile_ids.iter() {
+            let config = hevc_config_for(&meta.properties, *tile_id)
+                .map(TryClone::try_clone)
+                .transpose()
+                .map_err(|e| at!(Error::from(e)))?;
+            alpha_tile_hevc_configs.push(config).map_err(|e| at!(Error::from(e)))?;
+        }
 
         // Detect gain map (tmap derived image item)
         // Labelled so that anything unreadable inside can yield "no gain
@@ -3094,6 +3143,8 @@ impl<'data> AvifParser<'data> {
             },
             presented_items,
             alpha_tiles,
+            tile_hevc_configs,
+            alpha_tile_hevc_configs,
             exif_item,
             xmp_item,
             gain_map_metadata,
@@ -3526,6 +3577,33 @@ impl<'data> AvifParser<'data> {
         let item = self.tiles.get(index)
             .ok_or_else(|| at!(Error::InvalidData("tile index out of bounds")))?;
         self.resolve_item(item)
+    }
+
+    /// One grid tile's own decoder configuration, indexed as
+    /// [`Self::tile_data`] is.
+    ///
+    /// Distinct from [`Self::hevc_config`] for the reason
+    /// [`Self::thumbnail_hevc_config`] is: the tiles of a grid are separately
+    /// coded pictures and a file may give them different records. Decoding a
+    /// tile against another tile's parameter sets does not fail cleanly -- it
+    /// produces a picture of the wrong shape.
+    ///
+    /// `None` when the tile carries no `hvcC` of its own, in which case
+    /// [`Self::hevc_config`] is the record to use.
+    #[must_use]
+    pub fn tile_hevc_config(&self, index: usize) -> Option<&HEVCConfig> {
+        self.tile_hevc_configs.get(index).and_then(Option::as_ref)
+    }
+
+    /// One alpha tile's own decoder configuration, indexed as
+    /// [`Self::alpha_tile_data`] is.
+    ///
+    /// Needed for the reason [`Self::alpha_hevc_config`] is: an alpha
+    /// auxiliary is commonly coded monochrome beside a 4:2:0 colour tile, so
+    /// the two cannot share a record.
+    #[must_use]
+    pub fn alpha_tile_hevc_config(&self, index: usize) -> Option<&HEVCConfig> {
+        self.alpha_tile_hevc_configs.get(index).and_then(Option::as_ref)
     }
 
     /// How many alpha tiles a grid carries when its transparency hangs off
@@ -6178,6 +6256,20 @@ fn derivation_chain(meta: &AvifInternalMeta, from: u32) -> Result<TryVec<u32>> {
 ///
 /// Within one item the properties keep their association order, which is the
 /// order the file's `ipma` lists them.
+/// Whether the item with this id is a `grid`.
+///
+/// Ask this of the item that carries the coded data -- the last link of
+/// [`derivation_chain`] -- and not of the primary item. An `iden` wrapping a
+/// grid presents the assembly under its own crop or rotation, and the `iden`
+/// itself is not a grid; answering from it leaves the tiles unread and the
+/// picture reported as a single item of the wrong size.
+fn item_is_grid(meta: &AvifInternalMeta, item_id: u32) -> bool {
+    meta.item_infos
+        .iter()
+        .find(|info| info.item_id == item_id)
+        .is_some_and(|info| info.item_type == b"grid")
+}
+
 fn derivation_transforms_of(meta: &AvifInternalMeta, from: u32) -> Result<TryVec<DerivedTransform>> {
     let chain = derivation_chain(meta, from)?;
     let mut transforms = TryVec::new();
@@ -6658,10 +6750,14 @@ fn read_hvcc<T: Read>(src: &mut BMFFBox<'_, T>) -> Result<HEVCConfig> {
     let general_tier_flag = (byte1 >> 5) & 1 != 0;
     let general_profile_idc = byte1 & 0x1F;
 
-    // general_profile_compatibility_flags (32) and
-    // general_constraint_indicator_flags (48) describe conformance, not the
-    // pixel format, and nothing here needs them.
-    skip(src, 4 + 6)?;
+    // A decoder gates on what the SPS says it must do, not on the profile
+    // name, but the compatibility and constraint flags are the record's own
+    // account of which profiles it claims -- worth reporting, and free here.
+    let general_profile_compatibility_flags = be_u32(src)?;
+    let mut general_constraint_indicator_flags = [0_u8; 6];
+    for byte in &mut general_constraint_indicator_flags {
+        *byte = src.read_u8().map_err(|e| at!(Error::from(e)))?;
+    }
 
     let general_level_idc = src.read_u8().map_err(|e| at!(Error::from(e)))?;
 
@@ -6716,6 +6812,8 @@ fn read_hvcc<T: Read>(src: &mut BMFFBox<'_, T>) -> Result<HEVCConfig> {
         general_profile_space,
         general_tier_flag,
         general_profile_idc,
+        general_profile_compatibility_flags,
+        general_constraint_indicator_flags,
         general_level_idc,
         chroma_format_idc,
         bit_depth_luma,
@@ -6778,11 +6876,26 @@ mod hvcc_tests {
 
     /// Build an `hvcC` box around the given fixed-header tail and arrays.
     fn hvcc_box(byte1: u8, chroma: u8, luma_depth: u8, chroma_depth: u8, byte21: u8, arrays: &[u8]) -> std::vec::Vec<u8> {
+        hvcc_box_with_flags(byte1, 0, [0; 6], chroma, luma_depth, chroma_depth, byte21, arrays)
+    }
+
+    /// The same, with the conformance flags spelled out.
+    #[allow(clippy::too_many_arguments)]
+    fn hvcc_box_with_flags(
+        byte1: u8,
+        compatibility: u32,
+        constraints: [u8; 6],
+        chroma: u8,
+        luma_depth: u8,
+        chroma_depth: u8,
+        byte21: u8,
+        arrays: &[u8],
+    ) -> std::vec::Vec<u8> {
         let mut record = std::vec::Vec::new();
         record.push(1); // configurationVersion
         record.push(byte1); // profile_space | tier | profile_idc
-        record.extend_from_slice(&[0u8; 4]); // general_profile_compatibility_flags
-        record.extend_from_slice(&[0u8; 6]); // general_constraint_indicator_flags
+        record.extend_from_slice(&compatibility.to_be_bytes()); // general_profile_compatibility_flags
+        record.extend_from_slice(&constraints); // general_constraint_indicator_flags
         record.push(120); // general_level_idc, level 4.0
         record.extend_from_slice(&[0xF0, 0x00]); // reserved | min_spatial_segmentation_idc
         record.push(0xFC); // reserved | parallelismType
@@ -6848,6 +6961,28 @@ mod hvcc_tests {
         assert_eq!(cfg.parameter_sets[1].nal_unit_type, 33);
         assert!(!cfg.parameter_sets[1].array_completeness);
         assert_eq!(cfg.parameter_sets[1].data.as_slice(), &[0x42, 0x01, 0x01, 0x60]);
+    }
+
+    /// The record's own account of which profiles it claims. A Main Still
+    /// Picture stream sets compatibility bits its `general_profile_idc` does
+    /// not name, so a reader that gates on the idc alone reads it wrong;
+    /// reporting both leaves that judgement to the caller.
+    #[test]
+    fn reports_the_profile_compatibility_and_constraint_flags() {
+        // Bits 1..=3 set: conforms to Main, Main 10 and Main Still Picture.
+        let compatibility = 0b0111 << 28;
+        let constraints = [0x90, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let bytes =
+            hvcc_box_with_flags(0x03, compatibility, constraints, 1, 8, 8, 0x0F, &two_arrays());
+        let cfg = parse(&bytes).expect("hvcC parses");
+
+        assert_eq!(cfg.general_profile_idc, 3, "Main Still Picture");
+        assert_eq!(cfg.general_profile_compatibility_flags, compatibility);
+        assert_eq!(cfg.general_constraint_indicator_flags, constraints);
+        // The fields after them must still land where they belong.
+        assert_eq!(cfg.general_level_idc, 120);
+        assert_eq!(cfg.bit_depth_luma, 8);
+        assert_eq!(cfg.parameter_sets.len(), 2);
     }
 
     #[test]
@@ -7253,6 +7388,10 @@ fn read_hvcc_bytes(bytes: &[u8]) -> Option<HEVCConfig> {
         general_profile_space: byte1 >> 6,
         general_tier_flag: (byte1 >> 5) & 1 != 0,
         general_profile_idc: byte1 & 0x1F,
+        general_profile_compatibility_flags: u32::from_be_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]),
+        general_constraint_indicator_flags: [
+            bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11],
+        ],
         general_level_idc: bytes[12],
         chroma_format_idc: bytes[16] & 0x03,
         bit_depth_luma: (bytes[17] & 0x07) + 8,
@@ -8750,6 +8889,71 @@ mod sample_offset_overflow_tests {
         assert_eq!(plain.as_slice(), &[DerivedTransform::CleanAperture(aperture(600))]);
     }
 
+    /// A grid presented through an `iden` is still a grid.
+    ///
+    /// The wrapper exists to state a crop or a rotation without recoding, and
+    /// it is the wrapper the file names as primary. Asking IT whether the
+    /// picture is a grid answers no, and the tiles -- which are the picture --
+    /// never get read; the file then reports as a single item of the coded
+    /// tile's size rather than the assembly's.
+    #[test]
+    fn a_grid_behind_an_iden_is_still_a_grid() {
+        fn entry(item_id: u32, item_type: &[u8; 4]) -> ItemInfoEntry {
+            ItemInfoEntry { item_id, item_type: FourCC::from(*item_type) }
+        }
+        fn derives(from_item_id: u32, to_item_id: u32, reference_index: u16) -> SingleItemTypeReferenceBox {
+            SingleItemTypeReferenceBox {
+                item_type: FourCC::from(*b"dimg"),
+                from_item_id,
+                to_item_id,
+                reference_index,
+            }
+        }
+
+        // 3 (iden) --dimg--> 2 (grid) --dimg--> 10, 11 (coded tiles)
+        let mut item_infos = TryVec::new();
+        item_infos.push(entry(2, b"grid")).unwrap();
+        item_infos.push(entry(3, b"iden")).unwrap();
+        item_infos.push(entry(10, b"hvc1")).unwrap();
+        item_infos.push(entry(11, b"hvc1")).unwrap();
+
+        let mut item_references = TryVec::new();
+        item_references.push(derives(3, 2, 0)).unwrap();
+        item_references.push(derives(2, 10, 0)).unwrap();
+        item_references.push(derives(2, 11, 1)).unwrap();
+
+        let meta = AvifInternalMeta {
+            item_references,
+            properties: TryVec::new(),
+            primary_item_id: 3,
+            iloc_items: TryVec::new(),
+            item_infos,
+            idat: None,
+            entity_groups: TryVec::new(),
+            unsupported_essential: TryVec::new(),
+        };
+
+        let chain = derivation_chain(&meta, meta.primary_item_id).unwrap();
+        assert_eq!(chain.as_slice(), &[3, 2], "the `iden` resolves to the grid");
+
+        let coded_item_id = chain[chain.len() - 1];
+        assert!(item_is_grid(&meta, coded_item_id), "the coded item is the grid");
+        assert!(
+            !item_is_grid(&meta, meta.primary_item_id),
+            "the primary item is the `iden`, which is what made this worth fixing"
+        );
+
+        // And the tiles hang off the grid, not off the item the file names as
+        // primary, so the collection loop must ask the same id.
+        let tiles: std::vec::Vec<u32> = meta
+            .item_references
+            .iter()
+            .filter(|iref| iref.from_item_id == coded_item_id && iref.item_type == b"dimg")
+            .map(|iref| iref.to_item_id)
+            .collect();
+        assert_eq!(tiles, [10, 11]);
+    }
+
     /// A chain that refers to itself is refused rather than followed.
     #[test]
     fn a_derivation_cycle_is_refused() {
@@ -8798,6 +9002,8 @@ mod sample_offset_overflow_tests {
                 general_profile_space: 0,
                 general_tier_flag: false,
                 general_profile_idc: 1,
+                general_profile_compatibility_flags: 0,
+                general_constraint_indicator_flags: [0; 6],
                 general_level_idc: 60,
                 chroma_format_idc,
                 bit_depth_luma: 8,
