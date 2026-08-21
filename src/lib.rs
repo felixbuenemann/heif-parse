@@ -1571,6 +1571,7 @@ struct ParsedAnimationData {
     alpha_sample_table: Option<SampleTable>,
     loop_count: u32,
     color_codec_config: TrackCodecConfig,
+    alpha_codec_config: Option<TrackCodecConfig>,
 }
 
 #[cfg(feature = "eager")]
@@ -1891,6 +1892,18 @@ pub struct FrameRef<'a> {
     pub presentation_time_ticks: Option<i64>,
 }
 
+/// One sample from a timed alpha auxiliary track.
+///
+/// Alpha has its own decode order and composition timeline. It cannot in
+/// general be paired with a color sample carrying the same sample-table
+/// index; callers should join the tracks by presentation timestamp.
+pub struct AlphaFrameRef<'a> {
+    pub data: Cow<'a, [u8]>,
+    pub duration_ticks: u32,
+    pub duration_ms: u32,
+    pub presentation_time_ticks: Option<i64>,
+}
+
 /// Byte range of a media data box within the file.
 struct MdatBounds {
     offset: u64,
@@ -1995,6 +2008,7 @@ struct AnimationParserData {
     alpha_sample_table: Option<SampleTable>,
     loop_count: u32,
     codec_config: TrackCodecConfig,
+    alpha_codec_config: Option<TrackCodecConfig>,
 }
 
 /// Animation metadata from [`AvifParser`]
@@ -2006,6 +2020,10 @@ pub struct AnimationInfo {
     pub has_alpha: bool,
     /// Media timescale (ticks per second) for the color track.
     pub timescale: u32,
+    /// Number of samples in the alpha track, when present.
+    pub alpha_frame_count: Option<usize>,
+    /// Media timescale of the alpha track, when present.
+    pub alpha_timescale: Option<u32>,
 }
 
 /// Parsed structure from the box-level parse pass (no mdat data).
@@ -2209,6 +2227,7 @@ impl<'data> AvifParser<'data> {
                 alpha_sample_table: anim.alpha_sample_table,
                 loop_count: anim.loop_count,
                 codec_config: anim.color_codec_config,
+                alpha_codec_config: anim.alpha_codec_config,
             })
         } else {
             None
@@ -3422,6 +3441,37 @@ impl<'data> AvifParser<'data> {
         })
     }
 
+    fn resolve_alpha_frame(&self, index: usize) -> Result<Option<AlphaFrameRef<'_>>> {
+        let anim = self.animation_data.as_ref()
+            .ok_or_else(|| at!(Error::InvalidData("not an animated AVIF")))?;
+        let Some(sample_table) = anim.alpha_sample_table.as_ref() else {
+            return Ok(None);
+        };
+        if index >= sample_table.sample_sizes.len() {
+            return Err(at!(Error::InvalidData("alpha frame index out of bounds")));
+        }
+        let timescale = anim.alpha_media_timescale.unwrap_or(anim.media_timescale);
+        let (duration_ticks, duration_ms) =
+            self.calculate_frame_duration(sample_table, timescale, index)?;
+        let presentation_time_ticks = Self::calculate_presentation_time(sample_table, index)?;
+        let (offset, size) = self.calculate_sample_location(sample_table, index)?;
+        let start = usize::try_from(offset).map_err(|e| at!(Error::from(e)))?;
+        let end = start
+            .checked_add(size as usize)
+            .ok_or_else(|| at!(Error::InvalidData("alpha frame end overflow")))?;
+        let data = self
+            .raw
+            .as_ref()
+            .get(start..end)
+            .ok_or_else(|| at!(Error::InvalidData("alpha frame not found in raw buffer")))?;
+        Ok(Some(AlphaFrameRef {
+            data: Cow::Borrowed(data),
+            duration_ticks,
+            duration_ms,
+            presentation_time_ticks,
+        }))
+    }
+
     /// Calculate grid configuration from metadata.
     /// Read the `grid` box out of a grid item's own payload.
     ///
@@ -3732,6 +3782,11 @@ impl<'data> AvifParser<'data> {
         self.resolve_frame(index)
     }
 
+    /// Get one alpha-track sample in that track's decode order.
+    pub fn alpha_frame(&self, index: usize) -> Result<Option<AlphaFrameRef<'_>>> {
+        self.resolve_alpha_frame(index)
+    }
+
     /// Iterate over all animation frames.
     pub fn frames(&self) -> FrameIterator<'_> {
         let count = self
@@ -3752,6 +3807,8 @@ impl<'data> AvifParser<'data> {
             loop_count: data.loop_count,
             has_alpha: data.alpha_sample_table.is_some(),
             timescale: data.media_timescale,
+            alpha_frame_count: data.alpha_sample_table.as_ref().map(|table| table.sample_sizes.len()),
+            alpha_timescale: data.alpha_media_timescale,
         })
     }
 
@@ -4014,6 +4071,19 @@ impl<'data> AvifParser<'data> {
     #[must_use]
     pub fn track_hevc_config(&self) -> Option<&HEVCConfig> {
         self.animation_data.as_ref().and_then(|a| a.codec_config.hevc_config.as_ref())
+    }
+
+    /// The HEVC configuration from the alpha track's sample entry.
+    ///
+    /// Timed alpha is a separately coded track and commonly uses a
+    /// monochrome SPS and prediction settings that differ from both the
+    /// colour track and the still alpha auxiliary item.
+    #[must_use]
+    pub fn alpha_track_hevc_config(&self) -> Option<&HEVCConfig> {
+        self.animation_data
+            .as_ref()
+            .and_then(|a| a.alpha_codec_config.as_ref())
+            .and_then(|c| c.hevc_config.as_ref())
     }
 
     /// The track's frame size, from its `stsd` VisualSampleEntry.
@@ -8663,9 +8733,13 @@ fn associate_tracks(tracks: TryVec<ParsedTrack>) -> Result<Option<ParsedAnimatio
         (color, None)
     };
 
-    let (alpha_timescale, alpha_sample_table) = match alpha_track {
-        Some(t) => (Some(t.media_timescale), Some(t.sample_table)),
-        None => (None, None),
+    let (alpha_timescale, alpha_sample_table, alpha_codec_config) = match alpha_track {
+        Some(t) => (
+            Some(t.media_timescale),
+            Some(t.sample_table),
+            Some(t.codec_config),
+        ),
+        None => (None, None, None),
     };
 
     Ok(Some(ParsedAnimationData {
@@ -8674,6 +8748,7 @@ fn associate_tracks(tracks: TryVec<ParsedTrack>) -> Result<Option<ParsedAnimatio
         color_sample_table: color_track.sample_table,
         alpha_timescale,
         alpha_sample_table,
+        alpha_codec_config,
         loop_count: color_track.loop_count,
     }))
 }
