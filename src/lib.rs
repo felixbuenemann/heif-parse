@@ -1454,6 +1454,12 @@ struct TimeToSampleEntry {
 }
 
 #[derive(Debug)]
+struct CompositionOffsetEntry {
+    sample_count: u32,
+    sample_offset: i64,
+}
+
+#[derive(Debug)]
 struct SampleToChunkEntry {
     first_chunk: u32,
     samples_per_chunk: u32,
@@ -1496,6 +1502,7 @@ impl SampleSizes {
 #[derive(Debug)]
 struct SampleTable {
     time_to_sample: TryVec<TimeToSampleEntry>,
+    composition_offsets: TryVec<CompositionOffsetEntry>,
     sample_sizes: SampleSizes,
     /// Precomputed byte offset for each sample, derived from
     /// sample_to_chunk + chunk_offsets + sample_sizes during parsing.
@@ -1879,6 +1886,9 @@ pub struct FrameRef<'a> {
     /// among them. A caller reproducing timing losslessly wants this.
     pub duration_ticks: u32,
     pub duration_ms: u32,
+    /// Presentation timestamp in the track's timescale, when a `ctts` box
+    /// distinguishes composition order from sample/decode order.
+    pub presentation_time_ticks: Option<i64>,
 }
 
 /// Byte range of a media data box within the file.
@@ -3372,6 +3382,7 @@ impl<'data> AvifParser<'data> {
 
         let (duration_ticks, duration_ms) =
             self.calculate_frame_duration(&anim.sample_table, anim.media_timescale, index)?;
+        let presentation_time_ticks = Self::calculate_presentation_time(&anim.sample_table, index)?;
         let (offset, size) = self.calculate_sample_location(&anim.sample_table, index)?;
 
         let start = usize::try_from(offset).map_err(|e| at!(Error::from(e)))?;
@@ -3407,6 +3418,7 @@ impl<'data> AvifParser<'data> {
             alpha_data,
             duration_ticks,
             duration_ms,
+            presentation_time_ticks,
         })
     }
 
@@ -3541,6 +3553,52 @@ impl<'data> AvifParser<'data> {
             current_sample = current_sample.saturating_add(entry.sample_count as usize);
         }
         Ok((0, 0))
+    }
+
+    /// Calculate a composition timestamp for a sample. Without `ctts` the
+    /// caller gets `None`, preserving the distinction between decode-order
+    /// timestamps and an explicitly authored presentation timeline.
+    fn calculate_presentation_time(st: &SampleTable, index: usize) -> Result<Option<i64>> {
+        if st.composition_offsets.is_empty() {
+            return Ok(None);
+        }
+
+        let mut decode_time = 0_i64;
+        let mut current_sample = 0_usize;
+        for entry in &st.time_to_sample {
+            let count = entry.sample_count as usize;
+            if index < current_sample.saturating_add(count) {
+                let within = index.saturating_sub(current_sample) as i64;
+                decode_time = decode_time
+                    .checked_add(within.checked_mul(i64::from(entry.sample_delta)).ok_or_else(|| {
+                        at!(Error::InvalidData("animation decode timestamp overflow"))
+                    })?)
+                    .ok_or_else(|| at!(Error::InvalidData("animation decode timestamp overflow")))?;
+                break;
+            }
+            decode_time = decode_time
+                .checked_add(
+                    i64::from(entry.sample_count)
+                        .checked_mul(i64::from(entry.sample_delta))
+                        .ok_or_else(|| at!(Error::InvalidData("animation decode timestamp overflow")))?,
+                )
+                .ok_or_else(|| at!(Error::InvalidData("animation decode timestamp overflow")))?;
+            current_sample = current_sample.saturating_add(count);
+        }
+
+        let mut current_sample = 0_usize;
+        for entry in &st.composition_offsets {
+            if current_sample.saturating_add(entry.sample_count as usize) > index {
+                return decode_time
+                    .checked_add(entry.sample_offset)
+                    .map(Some)
+                    .ok_or_else(|| at!(Error::InvalidData("animation presentation timestamp overflow")));
+            }
+            current_sample = current_sample.saturating_add(entry.sample_count as usize);
+        }
+        Err(at!(Error::InvalidData(
+            "ctts has fewer samples than the animation sample table",
+        )))
     }
 
     /// Look up precomputed sample location (offset and size) from sample table.
@@ -8000,6 +8058,43 @@ fn read_stts<T: Read>(src: &mut BMFFBox<'_, T>) -> Result<TryVec<TimeToSampleEnt
     Ok(entries)
 }
 
+/// Parse Composition Time To Sample (`ctts`), ISO/IEC 14496-12 § 8.6.1.3.
+fn read_ctts<T: Read>(src: &mut BMFFBox<'_, T>) -> Result<TryVec<CompositionOffsetEntry>> {
+    let version = src.read_u8().map_err(|e| at!(Error::from(e)))?;
+    if version > 1 {
+        return Err(at!(Error::Unsupported("ctts version > 1")));
+    }
+    let _flags = [
+        src.read_u8().map_err(|e| at!(Error::from(e)))?,
+        src.read_u8().map_err(|e| at!(Error::from(e)))?,
+        src.read_u8().map_err(|e| at!(Error::from(e)))?,
+    ];
+    let entry_count = be_u32(src)?;
+    if u64::from(entry_count) * 8 > src.bytes_left() {
+        return Err(at!(Error::InvalidData(
+            "ctts entry_count exceeds remaining box bytes",
+        )));
+    }
+
+    let mut entries = TryVec::new();
+    for _ in 0..entry_count {
+        let sample_count = be_u32(src)?;
+        let bits = be_u32(src)?;
+        let sample_offset = if version == 0 {
+            i64::from(bits)
+        } else {
+            i64::from(bits as i32)
+        };
+        entries
+            .push(CompositionOffsetEntry {
+                sample_count,
+                sample_offset,
+            })
+            .map_err(|e| at!(Error::from(e)))?;
+    }
+    Ok(entries)
+}
+
 /// Parse Sample To Chunk box (stsc)
 /// See ISO/IEC 14496-12:2015 § 8.7.4
 fn read_stsc<T: Read>(src: &mut BMFFBox<'_, T>) -> Result<TryVec<SampleToChunkEntry>> {
@@ -8209,6 +8304,7 @@ fn read_stbl<T: Read>(
     stop: &dyn Stop,
 ) -> Result<(SampleTable, TrackCodecConfig)> {
     let mut time_to_sample = TryVec::new();
+    let mut composition_offsets = TryVec::new();
     let mut sample_to_chunk = TryVec::new();
     let mut sample_sizes = SampleSizes::Variable(TryVec::new());
     let mut chunk_offsets = TryVec::new();
@@ -8222,6 +8318,9 @@ fn read_stbl<T: Read>(
             }
             BoxType::TimeToSampleBox => {
                 time_to_sample = read_stts(&mut b)?;
+            }
+            BoxType::CompositionOffsetBox => {
+                composition_offsets = read_ctts(&mut b)?;
             }
             BoxType::SampleToChunkBox => {
                 sample_to_chunk = read_stsc(&mut b)?;
@@ -8248,6 +8347,7 @@ fn read_stbl<T: Read>(
 
     Ok((SampleTable {
         time_to_sample,
+        composition_offsets,
         sample_sizes,
         sample_offsets,
     }, codec_config))
@@ -8932,6 +9032,7 @@ mod sample_offset_overflow_tests {
         sample_sizes.push(10u32).unwrap(); // MAX-5 + 10 wraps
         let sample_table = SampleTable {
             time_to_sample: TryVec::new(),
+            composition_offsets: TryVec::new(),
             sample_sizes: SampleSizes::Variable(sample_sizes),
             sample_offsets,
         };
@@ -9225,5 +9326,78 @@ mod sample_offset_overflow_tests {
         assert_eq!(sizes.get(0), Some(1));
         assert_eq!(sizes.get(64 * 1024 * 1024 - 1), Some(1));
         assert_eq!(sizes.get(64 * 1024 * 1024), None);
+    }
+
+    #[test]
+    fn composition_offsets_keep_signed_and_unsigned_versions_distinct() {
+        let mut version_zero = std::vec::Vec::new();
+        version_zero.extend_from_slice(&[0, 0, 0, 0]);
+        version_zero.extend_from_slice(&1_u32.to_be_bytes());
+        version_zero.extend_from_slice(&2_u32.to_be_bytes());
+        version_zero.extend_from_slice(&u32::MAX.to_be_bytes());
+        let mut source = version_zero.as_slice();
+        let mut ctts = BMFFBox {
+            head: BoxHeader {
+                name: BoxType::CompositionOffsetBox,
+                size: version_zero.len() as u64,
+                offset: 0,
+                uuid: None,
+            },
+            content: <_ as Read>::take(&mut source, version_zero.len() as u64),
+        };
+        let entries = read_ctts(&mut ctts).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].sample_count, 2);
+        assert_eq!(entries[0].sample_offset, i64::from(u32::MAX));
+        drop(ctts);
+
+        let mut version_one = version_zero;
+        version_one[0] = 1;
+        let mut source = version_one.as_slice();
+        let mut ctts = BMFFBox {
+            head: BoxHeader {
+                name: BoxType::CompositionOffsetBox,
+                size: version_one.len() as u64,
+                offset: 0,
+                uuid: None,
+            },
+            content: <_ as Read>::take(&mut source, version_one.len() as u64),
+        };
+        let entries = read_ctts(&mut ctts).unwrap();
+        assert_eq!(entries[0].sample_offset, -1);
+    }
+
+    #[test]
+    fn composition_timestamps_reorder_decode_samples() {
+        let mut time_to_sample = TryVec::new();
+        time_to_sample
+            .push(TimeToSampleEntry {
+                sample_count: 3,
+                sample_delta: 10,
+            })
+            .unwrap();
+        let mut composition_offsets = TryVec::new();
+        for offset in [10_i64, 20, 0] {
+            composition_offsets
+                .push(CompositionOffsetEntry {
+                    sample_count: 1,
+                    sample_offset: offset,
+                })
+                .unwrap();
+        }
+        let table = SampleTable {
+            time_to_sample,
+            composition_offsets,
+            sample_sizes: SampleSizes::Constant { size: 1, count: 3 },
+            sample_offsets: TryVec::new(),
+        };
+        let timestamps: std::vec::Vec<i64> = (0..3)
+            .map(|index| {
+                AvifParser::<'static>::calculate_presentation_time(&table, index)
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(timestamps, [10, 30, 20]);
     }
 }
