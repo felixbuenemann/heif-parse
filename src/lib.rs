@@ -1408,6 +1408,27 @@ pub struct GridConfig {
     pub output_height: u32,
 }
 
+/// Canvas description from an image overlay (`iovl`) derived item.
+///
+/// The fill values are stored exactly as the file states them: unpremultiplied
+/// R, G, B and linear alpha in the inclusive 0..=65535 range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverlayConfig {
+    pub canvas_fill_value: [u16; 4],
+    pub output_width: u32,
+    pub output_height: u32,
+}
+
+/// One input to an image overlay, in bottom-to-top layering order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverlayInput {
+    pub item_id: u32,
+    pub horizontal_offset: i32,
+    pub vertical_offset: i32,
+    pub alpha_item_id: Option<u32>,
+    pub premultiplied_alpha: bool,
+}
+
 /// Frame information for animated AVIF
 #[cfg(feature = "eager")]
 #[deprecated(since = "1.5.0", note = "Use `AvifParser::frame()` which returns `FrameRef` instead")]
@@ -1916,6 +1937,14 @@ struct ItemExtents {
     extents: TryVec<ExtentRange>,
 }
 
+struct OverlayItem {
+    info: OverlayInput,
+    image: ItemExtents,
+    hevc_config: Option<HEVCConfig>,
+    alpha: Option<ItemExtents>,
+    alpha_hevc_config: Option<HEVCConfig>,
+}
+
 /// Zero-copy AVIF parser backed by a borrowed or owned byte buffer.
 ///
 /// `AvifParser` records byte offsets during parsing but does **not** copy
@@ -1950,6 +1979,8 @@ pub struct AvifParser<'data> {
     grid_config: Option<GridConfig>,
     grid_tile_extents: Option<ImageSpatialExtents>,
     tiles: TryVec<ItemExtents>,
+    overlay_config: Option<OverlayConfig>,
+    overlay_items: TryVec<OverlayItem>,
     thumbnails: TryVec<(ThumbnailInfo, ItemExtents, Option<HEVCConfig>)>,
     animation_data: Option<AnimationParserData>,
     premultiplied_alpha: bool,
@@ -2250,6 +2281,8 @@ impl<'data> AvifParser<'data> {
                 grid_config: None,
                 grid_tile_extents: None,
                 tiles: TryVec::new(),
+                overlay_config: None,
+                overlay_items: TryVec::new(),
                 thumbnails: TryVec::new(),
                 animation_data,
                 premultiplied_alpha: false,
@@ -2334,6 +2367,31 @@ impl<'data> AvifParser<'data> {
         // item's only, which is the whole chain exactly when it is one link.
         let derivation_transforms = derivation_transforms_of(&meta, meta.primary_item_id)?;
         let primary = Self::get_item_extents(&meta, coded_item_id)?;
+
+        let (overlay_config, overlay_items) = if item_is_overlay(&meta, coded_item_id) {
+            let (overlay, inputs) = Self::collect_overlay(
+                raw.as_ref(),
+                &parsed.mdat_bounds,
+                meta.idat.as_ref(),
+                &meta,
+                coded_item_id,
+                &primary,
+            )?;
+            tracker.validate_total_megapixels(overlay.output_width, overlay.output_height)?;
+            for input in &inputs {
+                presented_items
+                    .push(input.info.item_id)
+                    .map_err(|e| at!(Error::from(e)))?;
+                if let Some(alpha_item_id) = input.info.alpha_item_id {
+                    presented_items
+                        .push(alpha_item_id)
+                        .map_err(|e| at!(Error::from(e)))?;
+                }
+            }
+            (Some(overlay), inputs)
+        } else {
+            (None, TryVec::new())
+        };
 
         // Find alpha item and get its extents
         let alpha_item_id = meta
@@ -3125,6 +3183,8 @@ impl<'data> AvifParser<'data> {
             grid_config,
             grid_tile_extents,
             tiles,
+            overlay_config,
+            overlay_items,
             thumbnails,
             animation_data,
             premultiplied_alpha,
@@ -3472,6 +3532,105 @@ impl<'data> AvifParser<'data> {
         }))
     }
 
+    fn collect_overlay(
+        raw: &[u8],
+        mdat_bounds: &[MdatBounds],
+        idat: Option<&TryVec<u8>>,
+        meta: &AvifInternalMeta,
+        overlay_item_id: u32,
+        overlay_item: &ItemExtents,
+    ) -> Result<(OverlayConfig, TryVec<OverlayItem>)> {
+        let mut references: TryVec<(u32, u16)> = TryVec::new();
+        for reference in &meta.item_references {
+            if reference.from_item_id == overlay_item_id && reference.item_type == b"dimg" {
+                references
+                    .push((reference.to_item_id, reference.reference_index))
+                    .map_err(|e| at!(Error::from(e)))?;
+            }
+        }
+        references.sort_by_key(|&(_, index)| index);
+        if references.is_empty() {
+            return Err(at!(Error::InvalidData("iovl item references no input images")));
+        }
+
+        let payload = Self::resolve_derived_payload(raw, mdat_bounds, idat, overlay_item)
+            .ok_or_else(|| at!(Error::InvalidData("iovl item payload is unavailable")))?;
+        let mut cursor = std::io::Cursor::new(payload.as_slice());
+        let (config, offsets) = read_overlay_payload(&mut cursor, references.len())?;
+        if config.output_width == 0 || config.output_height == 0 {
+            return Err(at!(Error::InvalidData("iovl canvas has a zero dimension")));
+        }
+
+        let mut inputs = TryVec::new();
+        for (position, &(item_id, _)) in references.iter().enumerate() {
+            let derivation = derivation_chain(meta, item_id)?;
+            let coded_item_id = derivation[derivation.len() - 1];
+            if item_is_grid(meta, coded_item_id) || item_is_overlay(meta, coded_item_id) {
+                return Err(at!(Error::Unsupported(
+                    "nested grid or overlay input in iovl",
+                )));
+            }
+            let image = Self::get_item_extents(meta, coded_item_id)?;
+            let hevc_config = hevc_config_for(&meta.properties, coded_item_id)
+                .or_else(|| hevc_config_for(&meta.properties, item_id))
+                .map(TryClone::try_clone)
+                .transpose()
+                .map_err(|e| at!(Error::from(e)))?;
+
+            let alpha_item_id = meta
+                .item_references
+                .iter()
+                .filter(|reference| {
+                    reference.to_item_id == item_id
+                        && reference.from_item_id != item_id
+                        && reference.item_type == b"auxl"
+                })
+                .map(|reference| reference.from_item_id)
+                .find(|&candidate| {
+                    meta.properties.iter().any(|property| {
+                        property.item_id == candidate
+                            && matches!(
+                                &property.property,
+                                ItemProperty::AuxiliaryType(urn)
+                                    if is_alpha_auxiliary_urn(urn.type_subtype().0)
+                            )
+                    })
+                });
+            let alpha = alpha_item_id
+                .map(|alpha_item_id| Self::get_item_extents(meta, alpha_item_id))
+                .transpose()?;
+            let alpha_hevc_config = alpha_item_id
+                .and_then(|alpha_item_id| hevc_config_for(&meta.properties, alpha_item_id))
+                .map(TryClone::try_clone)
+                .transpose()
+                .map_err(|e| at!(Error::from(e)))?;
+            let premultiplied_alpha = alpha_item_id.is_some_and(|alpha_item_id| {
+                meta.item_references.iter().any(|reference| {
+                    reference.from_item_id == item_id
+                        && reference.to_item_id == alpha_item_id
+                        && reference.item_type == b"prem"
+                })
+            });
+            let (horizontal_offset, vertical_offset) = offsets[position];
+            inputs
+                .push(OverlayItem {
+                    info: OverlayInput {
+                        item_id,
+                        horizontal_offset,
+                        vertical_offset,
+                        alpha_item_id,
+                        premultiplied_alpha,
+                    },
+                    image,
+                    hevc_config,
+                    alpha,
+                    alpha_hevc_config,
+                })
+                .map_err(|e| at!(Error::from(e)))?;
+        }
+        Ok((config, inputs))
+    }
+
     /// Calculate grid configuration from metadata.
     /// Read the `grid` box out of a grid item's own payload.
     ///
@@ -3815,6 +3974,53 @@ impl<'data> AvifParser<'data> {
     /// Get grid configuration (if grid image).
     pub fn grid_config(&self) -> Option<&GridConfig> {
         self.grid_config.as_ref()
+    }
+
+    /// Canvas description for an `iovl` primary item.
+    #[must_use]
+    pub fn overlay_config(&self) -> Option<&OverlayConfig> {
+        self.overlay_config.as_ref()
+    }
+
+    /// Ordered overlay inputs, bottom-most first.
+    pub fn overlay_inputs(&self) -> impl Iterator<Item = OverlayInput> + '_ {
+        self.overlay_items.iter().map(|item| item.info)
+    }
+
+    /// Coded bytes for one overlay input.
+    pub fn overlay_input_data(&self, index: usize) -> Result<Cow<'_, [u8]>> {
+        let item = self
+            .overlay_items
+            .get(index)
+            .ok_or_else(|| at!(Error::InvalidData("overlay input index out of bounds")))?;
+        self.resolve_item(&item.image)
+    }
+
+    /// HEVC configuration associated with one overlay input.
+    #[must_use]
+    pub fn overlay_input_hevc_config(&self, index: usize) -> Option<&HEVCConfig> {
+        self.overlay_items
+            .get(index)
+            .and_then(|item| item.hevc_config.as_ref())
+    }
+
+    /// Alpha auxiliary bytes associated with one overlay input, if any.
+    pub fn overlay_input_alpha_data(
+        &self,
+        index: usize,
+    ) -> Option<Result<Cow<'_, [u8]>>> {
+        self.overlay_items
+            .get(index)
+            .and_then(|item| item.alpha.as_ref())
+            .map(|alpha| self.resolve_item(alpha))
+    }
+
+    /// HEVC configuration associated with one overlay input's alpha auxiliary.
+    #[must_use]
+    pub fn overlay_input_alpha_hevc_config(&self, index: usize) -> Option<&HEVCConfig> {
+        self.overlay_items
+            .get(index)
+            .and_then(|item| item.alpha_hevc_config.as_ref())
     }
 
     /// The size one tile of a grid is coded at, as the tiles declare it.
@@ -5992,7 +6198,7 @@ fn is_image_item_type(item_type: &FourCC) -> bool {
     matches!(
         &item_type.value,
         // Coded pictures, and the two derivations that stand for one.
-        b"av01" | b"hvc1" | b"hev1" | b"grid" | b"iden"
+        b"av01" | b"hvc1" | b"hev1" | b"grid" | b"iden" | b"iovl"
         // ISO/IEC 23001-17: a picture stored as samples rather than coded,
         // and the same wrapped in a general-purpose compressor. Both are
         // image items -- they carry `ispe` and are what `pitm` points at --
@@ -6396,6 +6602,13 @@ fn item_is_grid(meta: &AvifInternalMeta, item_id: u32) -> bool {
         .iter()
         .find(|info| info.item_id == item_id)
         .is_some_and(|info| info.item_type == b"grid")
+}
+
+fn item_is_overlay(meta: &AvifInternalMeta, item_id: u32) -> bool {
+    meta.item_infos
+        .iter()
+        .find(|info| info.item_id == item_id)
+        .is_some_and(|info| info.item_type == b"iovl")
 }
 
 fn derivation_transforms_of(meta: &AvifInternalMeta, from: u32) -> Result<TryVec<DerivedTransform>> {
@@ -6982,8 +7195,8 @@ mod brand_and_item_type_tests {
     }
 
     #[test]
-    fn coded_image_items_and_grid_are_image_items() {
-        for t in [b"av01", b"hvc1", b"hev1", b"grid"] {
+    fn coded_and_derived_image_items_are_image_items() {
+        for t in [b"av01", b"hvc1", b"hev1", b"grid", b"iovl"] {
             assert!(is_image_item_type(&cc(t)), "{} should be an image item", std::str::from_utf8(t).unwrap());
         }
     }
@@ -6992,9 +7205,40 @@ mod brand_and_item_type_tests {
     /// image; `tmap` in particular is a real sibling item in gain-map files.
     #[test]
     fn metadata_and_tone_map_items_are_not_image_items() {
-        for t in [b"Exif", b"mime", b"tmap", b"uri ", b"iovl"] {
+        for t in [b"Exif", b"mime", b"tmap", b"uri "] {
             assert!(!is_image_item_type(&cc(t)), "{} should not be an image item", std::str::from_utf8(t).unwrap());
         }
+    }
+
+    #[test]
+    fn overlay_payload_keeps_layer_offsets_and_field_widths() {
+        let mut narrow = std::vec::Vec::new();
+        narrow.extend_from_slice(&[0, 0]);
+        for value in [1_u16, 2, 3, u16::MAX, 1440, 960] {
+            narrow.extend_from_slice(&value.to_be_bytes());
+        }
+        for value in [-2_i16, 3, 17, -19] {
+            narrow.extend_from_slice(&value.to_be_bytes());
+        }
+        let (config, offsets) = read_overlay_payload(&mut narrow.as_slice(), 2).unwrap();
+        assert_eq!(config.canvas_fill_value, [1, 2, 3, u16::MAX]);
+        assert_eq!((config.output_width, config.output_height), (1440, 960));
+        assert_eq!(&*offsets, &[(-2, 3), (17, -19)]);
+
+        let mut wide = std::vec::Vec::new();
+        wide.extend_from_slice(&[0, 1]);
+        for value in [0_u16, 0, 0, u16::MAX] {
+            wide.extend_from_slice(&value.to_be_bytes());
+        }
+        for value in [100_000_u32, 80_000] {
+            wide.extend_from_slice(&value.to_be_bytes());
+        }
+        for value in [-70_000_i32, 60_000] {
+            wide.extend_from_slice(&value.to_be_bytes());
+        }
+        let (config, offsets) = read_overlay_payload(&mut wide.as_slice(), 1).unwrap();
+        assert_eq!((config.output_width, config.output_height), (100_000, 80_000));
+        assert_eq!(&*offsets, &[(-70_000, 60_000)]);
     }
 }
 
@@ -8854,6 +9098,52 @@ fn read_grid_payload<T: Read>(src: &mut T) -> Result<GridConfig> {
         (be_u32(src)?, be_u32(src)?)
     };
     Ok(GridConfig { rows, columns, output_width, output_height })
+}
+
+fn read_overlay_payload<T: Read>(
+    src: &mut T,
+    reference_count: usize,
+) -> Result<(OverlayConfig, TryVec<(i32, i32)>)> {
+    let version = src.read_u8().map_err(|e| at!(Error::from(e)))?;
+    if version != 0 {
+        return Err(at!(Error::Unsupported("iovl version is not zero")));
+    }
+    let flags = src.read_u8().map_err(|e| at!(Error::from(e)))?;
+    if flags & !1 != 0 {
+        return Err(at!(Error::Unsupported("iovl reserved flags are set")));
+    }
+    let canvas_fill_value = [
+        be_u16(src)?,
+        be_u16(src)?,
+        be_u16(src)?,
+        be_u16(src)?,
+    ];
+    let wide = flags & 1 != 0;
+    let (output_width, output_height) = if wide {
+        (be_u32(src)?, be_u32(src)?)
+    } else {
+        (u32::from(be_u16(src)?), u32::from(be_u16(src)?))
+    };
+    let mut offsets = TryVec::new();
+    for _ in 0..reference_count {
+        let pair = if wide {
+            (be_i32(src)?, be_i32(src)?)
+        } else {
+            (
+                i32::from(be_u16(src)? as i16),
+                i32::from(be_u16(src)? as i16),
+            )
+        };
+        offsets.push(pair).map_err(|e| at!(Error::from(e)))?;
+    }
+    Ok((
+        OverlayConfig {
+            canvas_fill_value,
+            output_width,
+            output_height,
+        },
+        offsets,
+    ))
 }
 
 fn read_grid<T: Read>(src: &mut BMFFBox<'_, T>, _options: &ParseOptions) -> Result<GridConfig> {
