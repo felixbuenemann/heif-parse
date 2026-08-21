@@ -1941,6 +1941,7 @@ struct OverlayItem {
     info: OverlayInput,
     image: ItemExtents,
     hevc_config: Option<HEVCConfig>,
+    transforms: TryVec<DerivedTransform>,
     alpha: Option<ItemExtents>,
     alpha_hevc_config: Option<HEVCConfig>,
 }
@@ -3571,6 +3572,7 @@ impl<'data> AvifParser<'data> {
                 )));
             }
             let image = Self::get_item_extents(meta, coded_item_id)?;
+            let transforms = derivation_transforms_of(meta, item_id)?;
             let hevc_config = hevc_config_for(&meta.properties, coded_item_id)
                 .or_else(|| hevc_config_for(&meta.properties, item_id))
                 .map(TryClone::try_clone)
@@ -3623,6 +3625,7 @@ impl<'data> AvifParser<'data> {
                     },
                     image,
                     hevc_config,
+                    transforms,
                     alpha,
                     alpha_hevc_config,
                 })
@@ -4002,6 +4005,12 @@ impl<'data> AvifParser<'data> {
         self.overlay_items
             .get(index)
             .and_then(|item| item.hevc_config.as_ref())
+    }
+
+    /// Transformative properties applied to one overlay input after decoding.
+    #[must_use]
+    pub fn overlay_input_transforms(&self, index: usize) -> Option<&[DerivedTransform]> {
+        self.overlay_items.get(index).map(|item| &*item.transforms)
     }
 
     /// Alpha auxiliary bytes associated with one overlay input, if any.
