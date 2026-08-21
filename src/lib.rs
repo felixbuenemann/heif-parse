@@ -8918,17 +8918,22 @@ fn read_mdia<T: Read>(
 
 /// Associate parsed tracks into color + optional alpha animation data.
 ///
-/// - Color track: first with handler `pict` (fallback: first track with a sample table)
+/// - Color track: first with handler `pict` or `vide` (fallback: first non-auxiliary visual track)
 /// - Alpha track: handler `auxv` with `tref/auxl` referencing color's track_id
 /// - Audio tracks (handler `soun`) are skipped
 fn associate_tracks(tracks: TryVec<ParsedTrack>) -> Result<Option<ParsedAnimationData>> {
-    // Find color track: first with handler_type == "pict"
+    // Both handler spellings are in use: AVIF writers commonly use `pict`,
+    // while x265-backed HEIC writers use the ISO base-media `vide` handler.
     let Some(color_idx) = tracks
         .iter()
-        .position(|t| t.handler_type == b"pict")
+        .position(|t| matches!(&t.handler_type.value, b"pict" | b"vide"))
         .or_else(|| {
-            // Fallback: first track that isn't audio
-            tracks.iter().position(|t| t.handler_type != b"soun")
+            // Unknown visual handler: never promote a known auxiliary or
+            // audio track merely because it precedes the picture.
+            tracks.iter().position(|t| {
+                !matches!(&t.handler_type.value, b"soun" | b"auxv")
+                    && !t.references.iter().any(|reference| reference.reference_type == b"auxl")
+            })
         })
     else {
         // A `moov` holding only audio is a still image with a sound recording

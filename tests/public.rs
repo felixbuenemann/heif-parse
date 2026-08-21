@@ -1426,6 +1426,29 @@ fn anim_two_tracks_with_alpha() {
 }
 
 #[test]
+fn anim_vide_color_track_keeps_its_auxiliary_alpha() {
+    let mut bytes = std::fs::read(ANIM_8BPC_ALPHA).expect("read file");
+    // This committed fixture writes the color-track handler as `pict`. Its
+    // last such handler is the color track (the auxiliary is `auxv`); change
+    // only that FourCC to the spelling x265-backed HEIC writers use.
+    let handler = bytes
+        .windows(4)
+        .rposition(|window| window == b"pict")
+        .expect("fixture has a color-track handler");
+    bytes[handler..handler + 4].copy_from_slice(b"vide");
+
+    let parser = heif_parse::AvifParser::from_bytes(&bytes).expect("parse failed");
+    let info = parser.animation_info().expect("Expected animation");
+    assert!(info.has_alpha, "a vide color track must retain its auxv track");
+    for index in 0..info.frame_count {
+        assert!(
+            parser.frame(index).expect("frame failed").alpha_data.is_some(),
+            "frame {index} lost its auxiliary sample"
+        );
+    }
+}
+
+#[test]
 fn anim_12bpc_with_alpha() {
     let bytes = std::fs::read(ANIM_12BPC_KF).expect("read file");
     let parser = heif_parse::AvifParser::from_bytes(&bytes).expect("parse failed");
